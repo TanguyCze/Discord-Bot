@@ -1,0 +1,22 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# yt-dlp cache & cookies
+yt-dlp-cache/
+cookies.txt
+*.cookies
+
+# Logs & OS files
+*.log
+.DS_Store
+Thumbs.db
