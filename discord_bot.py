@@ -1243,11 +1243,18 @@ async def slash_my_drops_feed(
     config_mgr.data["feeds"].append(new_feed)
     config_mgr.save()
 
+    cd_hours = config_mgr.data.get("drops_settings", {}).get("cooldown_hours", 48)
+    mode_label = (
+        "Single Live-Updating Message"
+        if single_message
+        else f"Cooldown Lock ({cd_hours}h between alerts)"
+    )
+
     await inter.followup.send(
         f"✅ **Personal Drops Feed Saved!**\n"
         f"• **Destination:** {dest_label}\n"
         f"• **Games:** {', '.join(game_list)}\n"
-        f"• **Anti-Spam Mode:** {'Single Live-Updating Message' if single_message else f'Cooldown Lock ({config_mgr.data['drops_settings']['cooldown_hours']}h between alerts)'}",
+        f"• **Anti-Spam Mode:** {mode_label}",
         ephemeral=True,
     )
 
