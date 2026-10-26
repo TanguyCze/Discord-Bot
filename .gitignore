@@ -20,3 +20,7 @@ cookies.txt
 *.log
 .DS_Store
 Thumbs.db
+
+# Persistent bot config & anti-spam state (preserved across git updates)
+bot_data.json
+bot_data.json.tmp

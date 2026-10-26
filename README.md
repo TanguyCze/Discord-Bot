@@ -29,10 +29,19 @@ A feature-rich Discord bot built with `discord.py` featuring YouTube music playb
 - `/teams [timeout]` — Open a reaction sign-up and split participants into two balanced random teams.
 - `/quiz` — Run a 5-question multiple-choice trivia game via The Trivia API with anti-cheat single-choice validation and a final leaderboard.
 
-### 🎁 Twitch Drops Monitor
-- Checks Twitch Helix API every 10 minutes for active `DropsEnabled` streams across monitored games.
-- Sends an alert embed to `TWITCH_NOTIFY_CHANNEL_ID` when a new Drops campaign starts.
-- `/drops list|add|remove [game_name]` — View or manage the list of monitored Twitch games at runtime.
+### 🎁 Anti-Spam Custom Twitch Drops Feeds & Web UI
+- **Built-in Web Control Panel (`http://<server-ip>:8080`)**:
+  - **Custom Drops Feeds**: Route specific games you care about to your **Private DM**, a **Specific Channel**, or click **Create Private Channel** to automatically create a locked channel visible only to you and the bot.
+  - **Strict Anti-Spam Engine**:
+    - Persists campaign state & timestamps in `bot_data.json` so Pterodactyl restarts **never** re-send duplicate alerts.
+    - Configurable **Cooldown Lock** (default `48h` between alerts for the same game) and **Hysteresis** (`6` consecutive empty checks before resetting).
+    - **Single Message Mode**: Option to edit one persistent embed in-place instead of posting new messages.
+  - **Channel & Category Manager**: Create Text, Voice, or Category channels in the exact Category you choose (Public or Private), move channels between categories, or configure multiple **Join-to-Create** voice lobbies with custom target categories.
+- `/my_drops_feed` — Subscribe to your chosen games via **DM** or auto-create a **Private Channel** in your chosen category directly from Discord.
+- `/create_channel` — Create a Text or Voice channel inside any chosen Category (with optional Private visibility).
+- `/panel` — View Web UI port and active anti-spam settings.
+- `/drops list|add|remove [game_name]` — View or manage monitored Twitch games.
+- [`custom_drops_feed.py`](./custom_drops_feed.py) — Standalone custom drops feed script that can also be run independently via cron/CLI.
 
 ---
 

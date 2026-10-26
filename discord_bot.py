@@ -1,5 +1,6 @@
 import os
 import time
+import uuid
 import random
 import asyncio
 import logging
@@ -10,11 +11,14 @@ from typing import List, Dict, Set, Optional, Union
 
 import discord
 import aiohttp
+from aiohttp import web
 from discord import app_commands
 from discord.ext import tasks, commands
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from discord.opus import load_opus, is_loaded
+
+from web_dashboard import ConfigManager, create_web_app
 
 ###############################################################################
 # ───────────────────────────────── LOGGING ────────────────────────────────── #
@@ -148,12 +152,21 @@ bot.auto_leave_tasks: Dict[int, asyncio.Task]  = {}
 bot.music_locks: Dict[int, asyncio.Lock]       = {}
 bot._synced: bool                              = False
 
-# Twitch Runtime State
+# Twitch Runtime State & Persistent Config
 bot.twitch_games: List[str]                    = ["Rust", "League of Legends", "Dark and Darker"]
 bot.active_campaigns: Dict[str, bool]          = {}
 bot.twitch_game_ids: Dict[str, str]            = {}
 bot.twitch_token: Optional[str]                = None
 bot.twitch_token_expiry: float                 = 0.0
+bot._web_started: bool                         = False
+
+WEB_PORT = env_int("WEB_PORT", env_int("SERVER_PORT", 8080))
+config_mgr = ConfigManager()
+config_mgr.ensure_default_migration(
+    legacy_lobby_id=LOBBY_CHANNEL_ID,
+    legacy_notify_channel_id=TWITCH_NOTIFY_CHANNEL_ID,
+    default_games=bot.twitch_games,
+)
 
 ###############################################################################
 # ──────────────────────────────── UTILITIES ───────────────────────────────── #
@@ -922,10 +935,54 @@ async def get_game_id(session: aiohttp.ClientSession, headers: Dict[str, str], g
         return None
 
 
-@tasks.loop(minutes=10)
-async def check_twitch_campaigns():
-    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_NOTIFY_CHANNEL_ID):
+async def resolve_feed_destination(feed: dict):
+    """Returns the discord.User (for DM) or discord.abc.Messageable channel for a custom feed."""
+    target_id_raw = str(feed.get("target_id") or "").strip()
+    if not target_id_raw.isdigit():
+        return None
+    tid = int(target_id_raw)
+    if feed.get("target_type") == "dm":
+        user = bot.get_user(tid)
+        if not user:
+            try:
+                user = await bot.fetch_user(tid)
+            except Exception:
+                return None
+        return user
+    else:
+        ch = bot.get_channel(tid)
+        if not ch:
+            try:
+                ch = await bot.fetch_channel(tid)
+            except Exception:
+                return None
+        return ch
+
+
+async def run_twitch_check() -> None:
+    """Anti-spam multi-feed Twitch Drops checker with disk persistence, cooldowns, and single-message mode."""
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET):
         return
+
+    feeds = [f for f in config_mgr.data.get("feeds", []) if f.get("enabled", True)]
+    if not feeds:
+        return
+
+    # Collect all unique game names across all active feeds
+    all_games: List[str] = []
+    for f in feeds:
+        for g in f.get("games", []):
+            g_clean = g.strip()
+            if g_clean and not any(x.lower() == g_clean.lower() for x in all_games):
+                all_games.append(g_clean)
+
+    if not all_games:
+        return
+
+    settings = config_mgr.data.get("drops_settings", {})
+    cooldown_sec = max(1, int(settings.get("cooldown_hours", 48))) * 3600
+    min_drop_streams = max(1, int(settings.get("min_drop_streams", 2)))
+    reset_checks = max(1, int(settings.get("inactive_checks_to_reset", 6)))
 
     try:
         timeout = aiohttp.ClientTimeout(total=15)
@@ -939,7 +996,9 @@ async def check_twitch_campaigns():
                 "Authorization": f"Bearer {token}",
             }
 
-            for game_name in list(bot.twitch_games):
+            # 1. Query Twitch once per unique game
+            game_status: Dict[str, dict] = {}
+            for game_name in all_games:
                 game_id = await get_game_id(session, headers, game_name)
                 if not game_id:
                     continue
@@ -948,50 +1007,154 @@ async def check_twitch_campaigns():
                 params = {"game_id": game_id, "first": "20"}
                 async with session.get(url, headers=headers, params=params) as resp:
                     if resp.status == 401:
-                        # Force token refresh next cycle
                         bot.twitch_token = None
                         return
                     if resp.status != 200:
                         continue
 
                     data = await resp.json()
-                    campaign_active = False
-
-                    for stream in data.get("data") or []:
+                    streams = data.get("data") or []
+                    drop_streams = []
+                    for stream in streams:
                         raw_tags = stream.get("tags") or []
                         normalized_tags = {t.lower().replace(" ", "") for t in raw_tags if isinstance(t, str)}
                         if "dropsenabled" in normalized_tags:
-                            campaign_active = True
-                            break
+                            drop_streams.append(stream)
 
-                    if campaign_active and not bot.active_campaigns.get(game_name):
-                        channel = bot.get_channel(TWITCH_NOTIFY_CHANNEL_ID)
-                        if not channel:
+                    req_count = 1 if len(streams) < 4 else min_drop_streams
+                    is_active = len(drop_streams) >= req_count
+                    top_stream = drop_streams[0] if drop_streams else None
+
+                    game_status[game_name.lower()] = {
+                        "name": game_name,
+                        "active": is_active,
+                        "drop_stream_count": len(drop_streams),
+                        "top_streamer": top_stream.get("user_name") if top_stream else None,
+                        "top_viewers": top_stream.get("viewer_count") if top_stream else 0,
+                    }
+                    bot.active_campaigns[game_name] = is_active
+
+            # 2. Evaluate each custom feed independently (DM or Private/Chosen Channel)
+            now_ts = time.time()
+            history = config_mgr.data.setdefault("campaign_history", {})
+            state_dirty = False
+
+            for feed in feeds:
+                fid = feed.get("id", "default")
+                feed_games = feed.get("games", [])
+                dest = await resolve_feed_destination(feed)
+                if not dest:
+                    continue
+
+                if feed.get("edit_single_message"):
+                    # Single Live-Updating Message Mode (Zero Spam)
+                    lines = []
+                    changed_state = False
+                    for g in feed_games:
+                        st = game_status.get(g.lower())
+                        if not st:
+                            continue
+                        hkey = f"{fid}::{st['name']}"
+                        entry = history.setdefault(hkey, {"active": False, "last_notified_ts": 0, "inactive_streak": 0})
+                        if st["active"] != entry.get("active"):
+                            changed_state = True
+                            entry["active"] = st["active"]
+                            entry["last_notified_ts"] = now_ts
+                            state_dirty = True
+
+                        encoded_game = quote(st["name"])
+                        link = f"https://www.twitch.tv/directory/game/{encoded_game}?tl=c2542d6d-cd10-4532-919b-3d19f30a768b"
+                        if st["active"]:
+                            top_info = f" • Top: **{st['top_streamer']}** ({st['top_viewers']} viewers)" if st["top_streamer"] else ""
+                            lines.append(f"🟢 **[{st['name']}]({link})** — Drops Active ({st['drop_stream_count']} streams){top_info}")
+                        else:
+                            lines.append(f"⚪ **{st['name']}** — No active campaign")
+
+                    if lines and (changed_state or not feed.get("last_message_id")):
+                        embed = discord.Embed(
+                            title=f"🎁 {feed.get('name', 'Personal Twitch Drops Feed')}",
+                            description="\n".join(lines),
+                            color=0x9146FF,
+                        )
+                        embed.set_footer(text="Live Single-Message Mode (Auto-updated without spamming)")
+                        last_mid = feed.get("last_message_id")
+                        edited = False
+                        if last_mid and hasattr(dest, "fetch_message"):
                             try:
-                                channel = await bot.fetch_channel(TWITCH_NOTIFY_CHANNEL_ID)
+                                old_msg = await dest.fetch_message(int(last_mid))
+                                await old_msg.edit(embed=embed)
+                                edited = True
                             except Exception:
-                                channel = None
+                                edited = False
+                        if not edited:
+                            try:
+                                sent = await dest.send(embed=embed)
+                                feed["last_message_id"] = str(sent.id)
+                                state_dirty = True
+                            except Exception as e:
+                                logger.warning("Failed sending single-msg feed %s: %s", fid, e)
+                else:
+                    # Standard Cooldown-Protected Alert Mode
+                    for g in feed_games:
+                        st = game_status.get(g.lower())
+                        if not st:
+                            continue
+                        gname = st["name"]
+                        hkey = f"{fid}::{gname}"
+                        entry = history.setdefault(
+                            hkey,
+                            {"active": False, "last_notified_ts": 0.0, "inactive_streak": 0},
+                        )
 
-                        if channel:
-                            encoded_game = quote(game_name)
-                            embed = discord.Embed(
-                                title=f"🚨 A {game_name} Drop Campaign just started!",
-                                description=(
-                                    f"Multiple top streamers are currently live with drops enabled for **{game_name}**.\n\n"
-                                    f"[Click here to browse {game_name} streams]"
-                                    f"(https://www.twitch.tv/directory/game/{encoded_game}?tl=c2542d6d-cd10-4532-919b-3d19f30a768b)"
-                                ),
-                                color=0x9146FF,
-                            )
-                            await channel.send(embed=embed)
+                        if st["active"]:
+                            entry["inactive_streak"] = 0
+                            elapsed = now_ts - float(entry.get("last_notified_ts") or 0.0)
+                            if not entry.get("active") and elapsed >= cooldown_sec:
+                                encoded_game = quote(gname)
+                                top_line = (
+                                    f"\n🔥 Top stream: **{st['top_streamer']}** (`{st['top_viewers']}` viewers)"
+                                    if st["top_streamer"]
+                                    else ""
+                                )
+                                embed = discord.Embed(
+                                    title=f"🚨 {gname} Twitch Drops Campaign Active!",
+                                    description=(
+                                        f"**{st['drop_stream_count']}** top streams currently have Drops enabled for **{gname}**.{top_line}\n\n"
+                                        f"👉 [Browse {gname} Drops Streams on Twitch]"
+                                        f"(https://www.twitch.tv/directory/game/{encoded_game}?tl=c2542d6d-cd10-4532-919b-3d19f30a768b)"
+                                    ),
+                                    color=0x9146FF,
+                                )
+                                embed.set_footer(
+                                    text=f"Feed: {feed.get('name')} • Cooldown lock: {settings.get('cooldown_hours', 48)}h"
+                                )
+                                try:
+                                    await dest.send(embed=embed)
+                                    entry["last_notified_ts"] = now_ts
+                                except Exception as e:
+                                    logger.warning("Failed sending drop alert for %s on %s: %s", gname, fid, e)
 
-                        bot.active_campaigns[game_name] = True
+                            if not entry.get("active"):
+                                entry["active"] = True
+                                state_dirty = True
+                        else:
+                            if entry.get("active"):
+                                entry["inactive_streak"] = int(entry.get("inactive_streak", 0)) + 1
+                                if entry["inactive_streak"] >= reset_checks:
+                                    entry["active"] = False
+                                    entry["inactive_streak"] = 0
+                                state_dirty = True
 
-                    elif not campaign_active and bot.active_campaigns.get(game_name):
-                        bot.active_campaigns[game_name] = False
+            if state_dirty:
+                config_mgr.save()
 
     except Exception as e:
         logger.error("❌ Twitch Campaign Checker Error: %s", e)
+
+
+@tasks.loop(minutes=10)
+async def check_twitch_campaigns():
+    await run_twitch_check()
 
 
 @check_twitch_campaigns.before_loop
@@ -999,7 +1162,168 @@ async def before_check_twitch():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="drops", description="View or manage games monitored for Twitch Drops")
+###############################################################################
+# ─────────────── CUSTOM DROPS FEEDS & CHANNEL SLASH COMMANDS ─────────────── #
+###############################################################################
+
+
+@bot.tree.command(name="my_drops_feed", description="Create a personal Twitch Drops feed in your DM or a private channel (no spam)")
+@app_commands.describe(
+    destination="Where should your personal drops alerts be sent?",
+    games="Comma-separated games you want (e.g. Rust, Dark and Darker, Escape from Tarkov)",
+    single_message="True = Edit 1 status message in-place (zero spam), False = Cooldown alerts",
+    category="If creating a Private Channel, which category should it be placed in?",
+)
+@app_commands.choices(
+    destination=[
+        app_commands.Choice(name="💬 Direct Message (DM me privately)", value="dm"),
+        app_commands.Choice(name="🔒 Create a Private Channel just for me", value="private_channel"),
+        app_commands.Choice(name="📢 Current Channel", value="current_channel"),
+    ]
+)
+async def slash_my_drops_feed(
+    inter: discord.Interaction,
+    destination: app_commands.Choice[str],
+    games: str,
+    single_message: bool = False,
+    category: Optional[discord.CategoryChannel] = None,
+):
+    await inter.response.defer(ephemeral=True)
+    game_list = [g.strip() for g in games.split(",") if g.strip()]
+    if not game_list:
+        return await inter.followup.send("❌ Please specify at least one game (e.g. `Rust, League of Legends`).", ephemeral=True)
+
+    dest_choice = destination.value
+    target_type = "dm"
+    target_id = str(inter.user.id)
+    dest_label = "your Direct Messages (DM)"
+
+    if dest_choice == "private_channel":
+        if not inter.guild:
+            return await inter.followup.send("❌ Private channels can only be created inside a server.", ephemeral=True)
+        overwrites = {
+            inter.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            inter.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
+            inter.user: discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True),
+        }
+        chan_name = f"🎁-drops-{inter.user.display_name.lower()[:18]}"
+        try:
+            priv_chan = await inter.guild.create_text_channel(
+                name=chan_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"Personal Twitch Drops feed for {inter.user.display_name}",
+            )
+            target_type = "channel"
+            target_id = str(priv_chan.id)
+            dest_label = f"private channel {priv_chan.mention}"
+        except Exception as e:
+            return await inter.followup.send(f"❌ Could not create private channel: {e}", ephemeral=True)
+
+    elif dest_choice == "current_channel":
+        if not inter.channel:
+            return await inter.followup.send("❌ Invalid channel.", ephemeral=True)
+        target_type = "channel"
+        target_id = str(inter.channel.id)
+        dest_label = f"<#{inter.channel.id}>"
+
+    # Replace or create this user's personal feed
+    feed_id = f"user_{inter.user.id}_{dest_choice}"
+    config_mgr.data["feeds"] = [f for f in config_mgr.data.get("feeds", []) if f.get("id") != feed_id]
+    new_feed = {
+        "id": feed_id,
+        "name": f"{inter.user.display_name}'s Drops ({dest_choice})",
+        "enabled": True,
+        "target_type": target_type,
+        "target_id": target_id,
+        "games": game_list,
+        "edit_single_message": single_message,
+        "last_message_id": None,
+    }
+    config_mgr.data["feeds"].append(new_feed)
+    config_mgr.save()
+
+    await inter.followup.send(
+        f"✅ **Personal Drops Feed Saved!**\n"
+        f"• **Destination:** {dest_label}\n"
+        f"• **Games:** {', '.join(game_list)}\n"
+        f"• **Anti-Spam Mode:** {'Single Live-Updating Message' if single_message else f'Cooldown Lock ({config_mgr.data['drops_settings']['cooldown_hours']}h between alerts)'}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="create_channel", description="Create a Text or Voice channel in the exact Category you choose")
+@app_commands.describe(
+    name="Name of the new channel",
+    channel_type="Text or Voice channel",
+    category="Choose which Category to place this channel in",
+    private="If True, hides the channel from @everyone and only gives you access",
+)
+@app_commands.choices(
+    channel_type=[
+        app_commands.Choice(name="💬 Text Channel", value="text"),
+        app_commands.Choice(name="🔊 Voice Channel", value="voice"),
+    ]
+)
+async def slash_create_channel(
+    inter: discord.Interaction,
+    name: str,
+    channel_type: app_commands.Choice[str],
+    category: Optional[discord.CategoryChannel] = None,
+    private: bool = False,
+):
+    if not inter.guild or not isinstance(inter.user, discord.Member):
+        return await inter.response.send_message("❌ Server only.", ephemeral=True)
+    if not (inter.user.guild_permissions.manage_channels or inter.user.guild_permissions.administrator):
+        return await inter.response.send_message("❌ You need `Manage Channels` permission.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True)
+    overwrites = {}
+    if private:
+        overwrites = {
+            inter.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            inter.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
+            inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True, manage_channels=True),
+        }
+
+    try:
+        if channel_type.value == "voice":
+            ch = await inter.guild.create_voice_channel(
+                name=name,
+                category=category,
+                overwrites=overwrites or discord.utils.MISSING,
+            )
+        else:
+            ch = await inter.guild.create_text_channel(
+                name=name,
+                category=category,
+                overwrites=overwrites or discord.utils.MISSING,
+            )
+        cat_str = f" inside **{category.name}**" if category else " (Top Level)"
+        priv_str = " 🔒 *(Private)*" if private else ""
+        await inter.followup.send(f"✅ Created {ch.mention}{cat_str}{priv_str}!", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"❌ Failed to create channel: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="panel", description="Show Web UI Control Panel port & active Drops feeds summary")
+async def slash_panel(inter: discord.Interaction):
+    feeds = config_mgr.data.get("feeds", [])
+    ds = config_mgr.data.get("drops_settings", {})
+    embed = discord.Embed(
+        title="🎛️ Bot Web Control Panel & Anti-Spam Status",
+        description=(
+            f"🌐 **Web UI Port:** `http://<your-server-ip>:{WEB_PORT}`\n"
+            f"🛡️ **Drops Cooldown Lock:** `{ds.get('cooldown_hours', 48)}h` per game (Persisted across restarts)\n"
+            f"📡 **Active Custom Feeds:** `{len(feeds)}`\n\n"
+            f"💡 *Tip: Use `/my_drops_feed` to get drops in your DMs or a private channel, or `/create_channel` to create channels in any category!*"
+        ),
+        color=0x5865F2,
+    )
+    await inter.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="drops", description="View or manage games in the default Twitch Drops feed")
 @app_commands.describe(
     action="Choose whether to list, add, or remove a game",
     game_name="Game name on Twitch (required for add/remove)",
@@ -1017,43 +1341,64 @@ async def slash_drops(
     game_name: Optional[str] = None,
 ):
     act = action.value
+    feeds = config_mgr.data.get("feeds", [])
     if act == "list":
-        if not bot.twitch_games:
-            return await inter.response.send_message("📭 No Twitch games are currently monitored.")
+        if not feeds:
+            return await inter.response.send_message(
+                "📭 No custom feeds configured yet. Use `/my_drops_feed` or the Web UI to create one!",
+                ephemeral=True,
+            )
         lines = []
-        for g in bot.twitch_games:
-            active = "🟢 Drops Active" if bot.active_campaigns.get(g) else "⚪ Idle"
-            lines.append(f"• **{g}** — {active}")
+        for f in feeds:
+            dest = f"DM (<@{f['target_id']}>)" if f.get("target_type") == "dm" else f"<#{f.get('target_id')}>"
+            games_str = ", ".join(f.get("games", [])) or "None"
+            lines.append(f"• **{f.get('name')}** → {dest}\n  Games: `{games_str}`")
         embed = discord.Embed(
-            title="🎁 Monitored Twitch Drops Games",
-            description="\n".join(lines),
+            title="🎁 Configured Twitch Drops Feeds",
+            description="\n\n".join(lines),
             color=0x9146FF,
         )
-        return await inter.response.send_message(embed=embed)
+        return await inter.response.send_message(embed=embed, ephemeral=True)
 
     if not inter.guild or not isinstance(inter.user, discord.Member):
         return await inter.response.send_message("❌ Server only.", ephemeral=True)
 
     if not (inter.user.guild_permissions.manage_guild or inter.user.guild_permissions.administrator):
-        return await inter.response.send_message("❌ You need `Manage Server` permission to edit monitored games.", ephemeral=True)
+        return await inter.response.send_message("❌ You need `Manage Server` permission to edit global feeds.", ephemeral=True)
 
     if not game_name or not game_name.strip():
         return await inter.response.send_message("❌ Please provide a `game_name`.", ephemeral=True)
 
     clean_name = game_name.strip()
+    if not feeds:
+        feeds.append(
+            {
+                "id": "default_feed",
+                "name": "Default Drops Feed",
+                "enabled": True,
+                "target_type": "channel",
+                "target_id": str(inter.channel.id),
+                "games": [],
+                "edit_single_message": False,
+                "last_message_id": None,
+            }
+        )
+
+    target_feed = feeds[0]
     if act == "add":
-        if any(g.lower() == clean_name.lower() for g in bot.twitch_games):
-            return await inter.response.send_message(f"ℹ️ **{clean_name}** is already being monitored.")
-        bot.twitch_games.append(clean_name)
-        return await inter.response.send_message(f"✅ Added **{clean_name}** to Twitch Drops monitor.")
+        if any(g.lower() == clean_name.lower() for g in target_feed["games"]):
+            return await inter.response.send_message(f"ℹ️ **{clean_name}** is already in **{target_feed['name']}**.", ephemeral=True)
+        target_feed["games"].append(clean_name)
+        config_mgr.save()
+        return await inter.response.send_message(f"✅ Added **{clean_name}** to **{target_feed['name']}**.", ephemeral=True)
 
     if act == "remove":
-        for existing in list(bot.twitch_games):
+        for existing in list(target_feed["games"]):
             if existing.lower() == clean_name.lower():
-                bot.twitch_games.remove(existing)
-                bot.active_campaigns.pop(existing, None)
-                return await inter.response.send_message(f"🗑️ Removed **{existing}** from Twitch Drops monitor.")
-        return await inter.response.send_message(f"❌ **{clean_name}** was not in the monitored list.")
+                target_feed["games"].remove(existing)
+                config_mgr.save()
+                return await inter.response.send_message(f"🗑️ Removed **{existing}** from **{target_feed['name']}**.", ephemeral=True)
+        return await inter.response.send_message(f"❌ **{clean_name}** was not found in **{target_feed['name']}**.", ephemeral=True)
 
 
 ###############################################################################
@@ -1076,11 +1421,20 @@ async def on_voice_state_update(
     if member.bot:
         return
 
-    # 1. Join Lobby -> Create Dynamic Channel
-    if LOBBY_CHANNEL_ID and after.channel and after.channel.id == LOBBY_CHANNEL_ID:
+    # 1. Join Lobby -> Create Dynamic Channel (Supports multiple lobbies & custom target categories from Web UI)
+    lobbies = config_mgr.data.get("lobbies", {})
+    if after.channel and str(after.channel.id) in lobbies:
         chan = None
         try:
-            cat = after.channel.category
+            lobby_cfg = lobbies[str(after.channel.id)]
+            target_cat_id = lobby_cfg.get("target_category_id")
+            cat = member.guild.get_channel(int(target_cat_id)) if target_cat_id else after.channel.category
+            if not isinstance(cat, discord.CategoryChannel):
+                cat = after.channel.category
+
+            template = lobby_cfg.get("name_template") or "🔊 {user}"
+            room_name = template.replace("{user}", member.display_name)[:95]
+
             overwrites = {
                 member: discord.PermissionOverwrite(
                     manage_channels=True,
@@ -1089,7 +1443,7 @@ async def on_voice_state_update(
                 )
             }
             chan = await member.guild.create_voice_channel(
-                name=f"🔊 {member.display_name}",
+                name=room_name,
                 category=cat,
                 overwrites=overwrites,
             )
@@ -1097,7 +1451,6 @@ async def on_voice_state_update(
             await member.move_to(chan)
         except Exception as e:
             logger.error("Lobby dynamic channel error: %s", e)
-            # Clean up orphaned channel if moving the member failed
             if chan and len([m for m in chan.members if not m.bot]) == 0:
                 try:
                     await chan.delete()
@@ -1130,9 +1483,21 @@ async def on_voice_state_update(
 async def on_ready():
     logger.info("✅ Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
+    if not bot._web_started:
+        try:
+            app = create_web_app(bot, config_mgr, run_twitch_check)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+            await site.start()
+            bot._web_started = True
+            logger.info("🌐 Web UI Control Panel listening on http://0.0.0.0:%d", WEB_PORT)
+        except Exception as e:
+            logger.error("❌ Failed to start Web UI on port %d: %s", WEB_PORT, e)
+
     if not check_twitch_campaigns.is_running():
         check_twitch_campaigns.start()
-        logger.info("✅ Twitch Campaign Checker started.")
+        logger.info("✅ Anti-Spam Twitch Drops Feed Engine started.")
 
     if not bot._synced:
         if TEST_GUILD_ID:
