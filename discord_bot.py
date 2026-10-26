@@ -160,7 +160,7 @@ bot.twitch_token: Optional[str]                = None
 bot.twitch_token_expiry: float                 = 0.0
 bot._web_started: bool                         = False
 
-WEB_PORT = env_int("WEB_PORT", env_int("SERVER_PORT", 8080))
+WEB_PORT = env_int("WEB_PORT", env_int("SERVER_PORT", 2457))
 config_mgr = ConfigManager()
 config_mgr.ensure_default_migration(
     legacy_lobby_id=LOBBY_CHANNEL_ID,

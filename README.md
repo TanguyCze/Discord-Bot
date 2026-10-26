@@ -30,7 +30,7 @@ A feature-rich Discord bot built with `discord.py` featuring YouTube music playb
 - `/quiz` — Run a 5-question multiple-choice trivia game via The Trivia API with anti-cheat single-choice validation and a final leaderboard.
 
 ### 🎁 Anti-Spam Custom Twitch Drops Feeds & Web UI
-- **Built-in Web Control Panel (`http://<server-ip>:8080`)**:
+- **Built-in Web Control Panel (`http://<server-ip>:2457`)**:
   - **Custom Drops Feeds**: Route specific games you care about to your **Private DM**, a **Specific Channel**, or click **Create Private Channel** to automatically create a locked channel visible only to you and the bot.
   - **Strict Anti-Spam Engine**:
     - Persists campaign state & timestamps in `bot_data.json` so Pterodactyl restarts **never** re-send duplicate alerts.
