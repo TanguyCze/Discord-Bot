@@ -1088,7 +1088,7 @@ async def run_twitch_check() -> None:
                                 edited = False
                         if not edited:
                             try:
-                                sent = await dest.send(embed=embed)
+                                sent = await dest.send(embed=embed, silent=True)
                                 feed["last_message_id"] = str(sent.id)
                                 state_dirty = True
                             except Exception as e:
@@ -1129,7 +1129,7 @@ async def run_twitch_check() -> None:
                                     text=f"Feed: {feed.get('name')} • Cooldown lock: {settings.get('cooldown_hours', 48)}h"
                                 )
                                 try:
-                                    await dest.send(embed=embed)
+                                    await dest.send(embed=embed, silent=True)
                                     entry["last_notified_ts"] = now_ts
                                 except Exception as e:
                                     logger.warning("Failed sending drop alert for %s on %s: %s", gname, fid, e)
@@ -1409,8 +1409,192 @@ async def slash_drops(
 
 
 ###############################################################################
+# ──────────────────── COMMUNITY ROLE & MEMBER SETUP ──────────────────────── #
+###############################################################################
+
+
+async def apply_community_role_setup(guild: discord.Guild) -> List[str]:
+    """
+    Configures role permissions, hierarchy, and member assignments:
+      - HRE (Day 1 Admins): .kanki, grosgul, horvath
+      - Gloria (Austrian Mod): ostblockpanda (can add channels, kick, ban, moderate)
+      - Baguette du Fromage (French Mods): mcwalter, caocao. (can add channels, kick, ban, moderate)
+      - Schnitzel (Austrian Members) & Baguette (French Members): Standard perms, no @everyone ping
+      - Stateless: Assigned to members with 0 roles; removed from members who already have Baguette/Schnitzel
+    """
+    logs: List[str] = []
+
+    role_hre = discord.utils.get(guild.roles, name="HRE")
+    role_gloria = discord.utils.get(guild.roles, name="Gloria")
+    role_fromage = discord.utils.get(guild.roles, name="Baguette du Fromage")
+    role_schnitzel = discord.utils.get(guild.roles, name="Schnitzel")
+    role_baguette = discord.utils.get(guild.roles, name="Baguette")
+    role_stateless = discord.utils.get(guild.roles, name="Stateless")
+
+    # 1. Permission templates
+    mod_perms = discord.Permissions(
+        view_channel=True,
+        manage_channels=True,
+        kick_members=True,
+        ban_members=True,
+        moderate_members=True,
+        manage_messages=True,
+        manage_nicknames=True,
+        mute_members=True,
+        deafen_members=True,
+        move_members=True,
+        priority_speaker=True,
+        create_instant_invite=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+        add_reactions=True,
+        use_external_emojis=True,
+        read_message_history=True,
+        connect=True,
+        speak=True,
+        stream=True,
+        use_voice_activation=True,
+        change_nickname=True,
+        use_application_commands=True,
+        create_public_threads=True,
+        create_private_threads=True,
+        mention_everyone=False,
+    )
+
+    member_perms = discord.Permissions(
+        view_channel=True,
+        create_instant_invite=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+        add_reactions=True,
+        use_external_emojis=True,
+        read_message_history=True,
+        connect=True,
+        speak=True,
+        stream=True,
+        use_voice_activation=True,
+        change_nickname=True,
+        use_application_commands=True,
+        create_public_threads=True,
+        create_private_threads=True,
+        mention_everyone=False,
+    )
+
+    # Update Role Permissions & Hoisting
+    for role, perms, hoist in [
+        (role_hre, discord.Permissions(administrator=True), True),
+        (role_gloria, mod_perms, True),
+        (role_fromage, mod_perms, True),
+        (role_schnitzel, member_perms, True),
+        (role_baguette, member_perms, True),
+        (role_stateless, member_perms, True),
+    ]:
+        if role:
+            try:
+                await role.edit(permissions=perms, hoist=hoist)
+                logs.append(f"✅ Updated permissions & hoist for role **{role.name}**")
+            except Exception as e:
+                logs.append(f"⚠️ Could not edit role **{role.name}** (Drag `DJ Otzi` above `{role.name}` in Server Settings → Roles): {e}")
+
+    # 2. Update Member Assignments
+    # HRE Admins: .kanki (216230929935499265), grosgul (437687259102183444), horvath (173474637785595905)
+    hre_ids = {216230929935499265, 437687259102183444, 173474637785595905}
+    # Austrian Mods (Gloria): ostblockpanda (423252232243511297)
+    gloria_ids = {423252232243511297}
+    # French Mods (Baguette du Fromage): mcwalter (196636952529731585), caocao. (225237921400094731)
+    fromage_ids = {196636952529731585, 225237921400094731}
+
+    for m in guild.members:
+        if m.bot:
+            continue
+
+        to_add = []
+        to_remove = []
+
+        # HRE assignment
+        if role_hre:
+            if m.id in hre_ids and role_hre not in m.roles:
+                to_add.append(role_hre)
+
+        # Gloria (Austrian Mod) assignment
+        if role_gloria:
+            if m.id in gloria_ids and role_gloria not in m.roles:
+                to_add.append(role_gloria)
+            elif m.id not in gloria_ids and role_gloria in m.roles:
+                to_remove.append(role_gloria)
+
+        # Baguette du Fromage (French Mod) assignment
+        if role_fromage:
+            if m.id in fromage_ids and role_fromage not in m.roles:
+                to_add.append(role_fromage)
+            elif m.id not in fromage_ids and role_fromage in m.roles:
+                to_remove.append(role_fromage)
+
+        # Stateless cleanup: give to roleless members, remove from members who already have Baguette or Schnitzel
+        if role_stateless:
+            has_community = (role_baguette and role_baguette in m.roles) or (role_schnitzel and role_schnitzel in m.roles) or (m.id in hre_ids)
+            non_everyone_roles = [r for r in m.roles if r.id != guild.id]
+            if has_community and role_stateless in m.roles:
+                to_remove.append(role_stateless)
+            elif not non_everyone_roles and not to_add:
+                to_add.append(role_stateless)
+
+        if to_add:
+            try:
+                await m.add_roles(*to_add, reason="Community role setup by DJ Otzi")
+                logs.append(f"➕ Added {', '.join(r.name for r in to_add)} to **{m.display_name}**")
+            except Exception as e:
+                logs.append(f"⚠️ Could not add roles to **{m.display_name}**: {e}")
+
+        if to_remove:
+            try:
+                await m.remove_roles(*to_remove, reason="Community role cleanup by DJ Otzi")
+                logs.append(f"➖ Removed {', '.join(r.name for r in to_remove)} from **{m.display_name}**")
+            except Exception as e:
+                logs.append(f"⚠️ Could not remove roles from **{m.display_name}**: {e}")
+
+    return logs
+
+
+@bot.tree.command(name="setup_roles", description="Apply the HRE / French / Austrian / Stateless role permissions and assignments")
+async def slash_setup_roles(inter: discord.Interaction):
+    if not inter.guild or not isinstance(inter.user, discord.Member):
+        return await inter.response.send_message("❌ Server only.", ephemeral=True)
+    if not inter.user.guild_permissions.administrator:
+        return await inter.response.send_message("❌ Only HRE Administrators can run this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True)
+    logs = await apply_community_role_setup(inter.guild)
+    summary = "\n".join(logs[:25])
+    if len(logs) > 25:
+        summary += f"\n... and {len(logs) - 25} more updates."
+    embed = discord.Embed(
+        title="🏛️ Community Role & Permission Setup Results",
+        description=summary or "✅ All roles and members are already up to date!",
+        color=0x2ECC71,
+    )
+    await inter.followup.send(embed=embed, ephemeral=True)
+
+
+###############################################################################
 # ───────────────────────────── GLOBAL EVENTS ──────────────────────────────── #
 ###############################################################################
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Automatically give new members the Stateless role when they join."""
+    if member.bot:
+        return
+    role_stateless = discord.utils.get(member.guild.roles, name="Stateless")
+    if role_stateless:
+        try:
+            await member.add_roles(role_stateless, reason="Auto-role on join (Stateless)")
+            logger.info("✅ Assigned Stateless role to new member %s", member.display_name)
+        except Exception as e:
+            logger.warning("Could not assign Stateless to new member %s: %s", member.display_name, e)
 
 
 @bot.event
@@ -1492,7 +1676,7 @@ async def on_ready():
 
     if not bot._web_started:
         try:
-            app = create_web_app(bot, config_mgr, run_twitch_check)
+            app = create_web_app(bot, config_mgr, run_twitch_check, apply_community_role_setup)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)

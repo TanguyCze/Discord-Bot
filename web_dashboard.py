@@ -369,6 +369,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('drops', this)">🎁 Custom Drops Feeds & Anti-Spam</button>
       <button class="tab-btn" onclick="switchTab('channels', this)">🛠️ Channel & Category Manager</button>
+      <button class="tab-btn" onclick="switchTab('roles', this)">👥 Roles & Community Manager</button>
       <button class="tab-btn" onclick="switchTab('lobbies', this)">🔊 Join-to-Create Lobbies</button>
     </div>
 
@@ -561,6 +562,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- TAB 4: ROLES & COMMUNITY MANAGER -->
+    <div id="tab-roles" class="tab-content">
+      <div class="grid">
+        <div>
+          <div class="card">
+            <h2>🏛️ One-Click Community Role Setup</h2>
+            <p class="sub">Automatically configures HRE (kanki, grosgul, horvath), Austrian Mod (ostblockpanda), French Mods (mcwalter, caocao), disables @everyone ping spam, and assigns Stateless to roleless members.</p>
+            <p style="font-size:0.84rem; color:var(--warning); margin-bottom:12px;">
+              ⚠️ <b>Important:</b> Make sure <code>DJ Otzi</code> is dragged to the very top of <b>Server Settings → Roles</b> in Discord so it has permission to edit roles above it!
+            </p>
+            <button class="btn btn-success" onclick="applyCommunityRoles()">⚡ Apply Community Role & Member Setup</button>
+            <pre id="role-setup-log" style="margin-top:12px; background:var(--panel-alt); padding:10px; border-radius:8px; font-size:0.8rem; white-space:pre-wrap; display:none;"></pre>
+          </div>
+
+          <div class="card">
+            <h2>🎖️ Server Roles Hierarchy</h2>
+            <p class="sub">Current roles from top to bottom.</p>
+            <div id="roles-list"></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <h2>👥 Member Role Assignments</h2>
+            <p class="sub">Assign or remove roles for any member with one click.</p>
+            <input type="text" id="member-search" placeholder="🔍 Search member..." oninput="renderMembersRoles(getCurrentGuild())" style="margin-bottom:12px;" />
+            <div id="members-roles-list" style="max-height:620px; overflow-y:auto;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="toast"></div>
@@ -737,6 +770,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       renderChannelsTree(g);
       renderLobbies(g);
+      renderRolesList(g);
+      renderMembersRoles(g);
     }
 
     function renderFeeds() {
@@ -1028,6 +1063,79 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function renderRolesList(g) {
+      const box = document.getElementById("roles-list");
+      if (!box || !g || !g.roles) return;
+      box.innerHTML = "";
+      g.roles.forEach(r => {
+        const div = document.createElement("div");
+        div.className = "chan-item";
+        div.innerHTML = `
+          <span><b style="color:${r.color !== '#000000' ? r.color : 'var(--text)'}">[${r.position}] ${r.name}</b></span>
+          <span style="font-size:0.8rem; color:var(--muted);">${r.managed ? '🤖 Bot/Managed' : ''}</span>
+        `;
+        box.appendChild(div);
+      });
+    }
+
+    function renderMembersRoles(g) {
+      const box = document.getElementById("members-roles-list");
+      if (!box || !g) return;
+      const q = (document.getElementById("member-search")?.value || "").toLowerCase();
+      box.innerHTML = "";
+      const assignRoles = (g.roles || []).filter(r => !r.managed && r.name !== "@everyone");
+
+      g.members.filter(m => m.display_name.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).forEach(m => {
+        const div = document.createElement("div");
+        div.className = "feed-item";
+        const currentPills = (m.roles || []).map(rid => {
+          const rObj = (g.roles || []).find(x => x.id === rid);
+          if (!rObj) return "";
+          return `<span class="pill">${rObj.name} <button onclick="toggleMemberRole('${g.id}', '${m.id}', '${rid}', 'remove')">&times;</button></span>`;
+        }).join(" ");
+
+        const addOpts = ['<option value="">+ Add Role...</option>'].concat(
+          assignRoles.filter(r => !(m.roles || []).includes(r.id)).map(r => `<option value="${r.id}">${r.name}</option>`)
+        ).join("");
+
+        div.innerHTML = `
+          <div class="feed-header">
+            <div><strong>${m.display_name}</strong> <span style="color:var(--muted); font-size:0.8rem;">(@${m.name})</span></div>
+            <select style="width:170px; padding:4px 8px; font-size:0.8rem;" onchange="if(this.value) toggleMemberRole('${g.id}', '${m.id}', this.value, 'add')">
+              ${addOpts}
+            </select>
+          </div>
+          <div class="pill-list">${currentPills || '<span style="font-size:0.8rem;color:var(--muted);">No roles</span>'}</div>
+        `;
+        box.appendChild(div);
+      });
+    }
+
+    async function toggleMemberRole(guildId, memberId, roleId, action) {
+      try {
+        await api("/api/roles/member", "POST", { guild_id: guildId, member_id: memberId, role_id: roleId, action });
+        showToast("✅ Member role updated!");
+        await loadState();
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    async function applyCommunityRoles() {
+      try {
+        const g = getCurrentGuild();
+        if (!g) return;
+        const res = await api("/api/roles/setup_community", "POST", { guild_id: g.id });
+        const logBox = document.getElementById("role-setup-log");
+        logBox.style.display = "block";
+        logBox.textContent = (res.logs || []).join("\n") || "All roles up to date!";
+        showToast("✅ Community roles applied!");
+        await loadState();
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
     loadState();
   </script>
 </body>
@@ -1048,7 +1156,7 @@ def check_auth(request: web.Request) -> bool:
     return key == secret
 
 
-def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops_cb) -> web.Application:
+def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops_cb, setup_roles_cb=None) -> web.Application:
     app = web.Application()
 
     async def index(request: web.Request) -> web.Response:
@@ -1083,8 +1191,23 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
                         "category_name": c.category.name if c.category else None,
                     }
                 )
+            roles = [
+                {
+                    "id": str(r.id),
+                    "name": r.name,
+                    "position": r.position,
+                    "color": f"#{r.color.value:06x}",
+                    "managed": r.managed,
+                }
+                for r in sorted(g.roles, key=lambda x: x.position, reverse=True)
+            ]
             members = [
-                {"id": str(m.id), "name": m.name, "display_name": m.display_name}
+                {
+                    "id": str(m.id),
+                    "name": m.name,
+                    "display_name": m.display_name,
+                    "roles": [str(r.id) for r in m.roles if r.id != g.id],
+                }
                 for m in g.members
                 if not m.bot
             ][:250]
@@ -1095,6 +1218,7 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
                     "name": g.name,
                     "categories": categories,
                     "channels": channels,
+                    "roles": roles,
                     "members": members,
                 }
             )
@@ -1337,6 +1461,39 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
         config_mgr.save()
         return web.json_response({"ok": True})
 
+    async def member_role_toggle(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        guild = bot.get_guild(int(body.get("guild_id") or 0))
+        if not guild:
+            return web.json_response({"error": "Guild not found"}, status=404)
+        member = guild.get_member(int(body.get("member_id") or 0))
+        role = guild.get_role(int(body.get("role_id") or 0))
+        if not member or not role:
+            return web.json_response({"error": "Member or role not found"}, status=404)
+        try:
+            if body.get("action") == "remove":
+                await member.remove_roles(role, reason="Web UI Role Manager")
+            else:
+                await member.add_roles(role, reason="Web UI Role Manager")
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response(
+                {"error": f"{e} (Ensure DJ Otzi is dragged above '{role.name}' in Server Settings -> Roles)"},
+                status=400,
+            )
+
+    async def run_setup_community(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        guild = bot.get_guild(int(body.get("guild_id") or 0))
+        if not guild or not setup_roles_cb:
+            return web.json_response({"error": "Guild not found"}, status=404)
+        logs = await setup_roles_cb(guild)
+        return web.json_response({"ok": True, "logs": logs})
+
     app.router.add_get("/", index)
     app.router.add_get("/api/state", get_state)
     app.router.add_post("/api/feeds", add_feed)
@@ -1350,5 +1507,7 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
     app.router.add_post("/api/channels/delete", delete_channel)
     app.router.add_post("/api/lobbies", save_lobby)
     app.router.add_delete("/api/lobbies/{id}", delete_lobby)
+    app.router.add_post("/api/roles/member", member_role_toggle)
+    app.router.add_post("/api/roles/setup_community", run_setup_community)
 
     return app
