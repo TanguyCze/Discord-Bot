@@ -103,7 +103,7 @@ class ConfigManager:
 # ──────────────────────────── WEB UI HTML/JS ─────────────────────────────── #
 ###############################################################################
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -705,6 +705,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         renderHistory();
         renderGamePills();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -929,6 +930,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Custom Drops Feed saved!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -939,6 +941,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("🗑️ Feed removed.");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -949,6 +952,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("📨 Test drop notification sent!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -963,6 +967,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Anti-spam settings updated!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -973,6 +978,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("🔍 Triggered immediate Twitch Drops check!");
         setTimeout(loadState, 2500);
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -983,6 +989,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Cooldown reset for " + key);
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1005,6 +1012,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Channel created!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1020,6 +1028,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Channel moved!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1035,6 +1044,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("🗑️ Channel deleted.");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1049,6 +1059,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Lobby rule saved!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1059,6 +1070,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("🗑️ Lobby rule deleted.");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1117,6 +1129,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Member role updated!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
@@ -1132,6 +1145,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         showToast("✅ Community roles applied!");
         await loadState();
       } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
       }
     }
