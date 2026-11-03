@@ -1579,6 +1579,243 @@ async def slash_setup_roles(inter: discord.Interaction):
 
 
 ###############################################################################
+# ──────────────────── REACTION & BUTTON ROLE SYSTEM ───────────────────────── #
+###############################################################################
+
+DEFAULT_REACTION_ROLES: Dict[str, str] = {
+    "🥖": "1221089896257683466",  # Baguette (French Community)
+    "🥩": "1221089786534563840",  # Schnitzel (Austrian Community)
+    "🌍": "1221096152389259325",  # Stateless (International / English)
+    "🎁": "1499718295211872357",  # twitch drop (Twitch Drops Alerts)
+}
+
+WELCOME_ROLE_CHANNEL_ID = 575643151268708354  # #lets-go-brandon
+
+
+async def post_role_panel(channel: discord.TextChannel) -> int:
+    """Posts an interactive Button + Emoji Reaction Role Selection Panel to the given channel."""
+    guild = channel.guild
+    role_baguette = discord.utils.get(guild.roles, name="Baguette")
+    role_schnitzel = discord.utils.get(guild.roles, name="Schnitzel")
+    role_stateless = discord.utils.get(guild.roles, name="Stateless")
+    role_drops = discord.utils.get(guild.roles, name="twitch drop")
+
+    id_baguette = str(role_baguette.id) if role_baguette else DEFAULT_REACTION_ROLES["🥖"]
+    id_schnitzel = str(role_schnitzel.id) if role_schnitzel else DEFAULT_REACTION_ROLES["🥩"]
+    id_stateless = str(role_stateless.id) if role_stateless else DEFAULT_REACTION_ROLES["🌍"]
+    id_drops = str(role_drops.id) if role_drops else DEFAULT_REACTION_ROLES["🎁"]
+
+    embed = discord.Embed(
+        title="🎭 Choose Your Community & Notification Roles",
+        description=(
+            f"Welcome to **{guild.name}**! Click the **buttons** or **react with the emojis** below to unlock your community channels:\n\n"
+            "🥖 **Baguette (French Community)**\n"
+            "Unlock `#baguette-chat`, `#melting-pot`, and `🔊 Baguette Voice`.\n\n"
+            "🥩 **Schnitzel (Austrian Community)**\n"
+            "Unlock `#schnitzel-chat`, `#melting-pot`, and `🔊 Schnitzel Voice`.\n\n"
+            "🌍 **Stateless (International / English)**\n"
+            "Unlock `#melting-pot` to hang out with everyone.\n\n"
+            "🎁 **Twitch Drops Alerts**\n"
+            "Get access & notifications for active Twitch Drops campaigns in `#twitch`."
+        ),
+        color=0x5865F2,
+    )
+    embed.set_footer(text="Click a button or react below at any time to add or remove a role!")
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle.primary,
+            label="Baguette (FR)",
+            emoji="🥖",
+            custom_id=f"rr_role:{id_baguette}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label="Schnitzel (AT)",
+            emoji="🥩",
+            custom_id=f"rr_role:{id_schnitzel}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Stateless (INT)",
+            emoji="🌍",
+            custom_id=f"rr_role:{id_stateless}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label="Twitch Drops",
+            emoji="🎁",
+            custom_id=f"rr_role:{id_drops}",
+        )
+    )
+
+    msg = await channel.send(embed=embed, view=view)
+    for emoji_char in ("🥖", "🥩", "🌍", "🎁"):
+        try:
+            await msg.add_reaction(emoji_char)
+        except Exception:
+            pass
+
+    panel_msgs = config_mgr.data.setdefault("role_panel_messages", [])
+    if str(msg.id) not in panel_msgs:
+        panel_msgs.append(str(msg.id))
+    rr_map = config_mgr.data.setdefault("reaction_roles", {})
+    rr_map["🥖"] = id_baguette
+    rr_map["🥩"] = id_schnitzel
+    rr_map["🌍"] = id_stateless
+    rr_map["🎁"] = id_drops
+    config_mgr.save()
+    return msg.id
+
+
+@bot.tree.command(name="role_panel", description="Post the interactive Reaction & Button Role Selection Panel")
+@app_commands.describe(channel="Channel where the Role Selection Panel should be posted (defaults to current channel)")
+async def slash_role_panel(inter: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not inter.guild or not isinstance(inter.user, discord.Member):
+        return await inter.response.send_message("❌ Server only.", ephemeral=True)
+    if not (inter.user.guild_permissions.manage_roles or inter.user.guild_permissions.administrator):
+        return await inter.response.send_message("❌ You need `Manage Roles` or `Administrator` permission.", ephemeral=True)
+
+    target_ch = channel or (inter.channel if isinstance(inter.channel, discord.TextChannel) else None)
+    if not target_ch:
+        return await inter.response.send_message("❌ Please select a valid text channel.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True)
+    try:
+        await post_role_panel(target_ch)
+        await inter.followup.send(f"✅ Posted Role Selection Panel in {target_ch.mention}!", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"❌ Failed to post Role Selection Panel: {e}", ephemeral=True)
+
+
+def _is_role_panel_event(payload: discord.RawReactionActionEvent) -> bool:
+    panel_msgs = set(str(x) for x in config_mgr.data.get("role_panel_messages", []))
+    panel_msgs.add("1567095715807633449")
+    if str(payload.message_id) in panel_msgs:
+        return True
+    if payload.channel_id == WELCOME_ROLE_CHANNEL_ID:
+        return True
+    return False
+
+
+@bot.event
+async def on_interaction(inter: discord.Interaction):
+    """Handles stateless persistent Role Panel button clicks across restarts."""
+    if inter.type != discord.InteractionType.component or not inter.data:
+        return
+    custom_id = str(inter.data.get("custom_id") or "")
+    if not custom_id.startswith("rr_role:"):
+        return
+
+    if not inter.guild or not isinstance(inter.user, discord.Member):
+        return await inter.response.send_message("❌ Server only.", ephemeral=True)
+
+    role_id_str = custom_id.split(":", 1)[1].strip()
+    if not role_id_str.isdigit():
+        return
+    role = inter.guild.get_role(int(role_id_str))
+    if not role:
+        return await inter.response.send_message("❌ Role not found on this server.", ephemeral=True)
+
+    try:
+        if role in inter.user.roles:
+            await inter.user.remove_roles(role, reason="Role Panel button toggle")
+            await inter.response.send_message(f"➖ Removed role **{role.name}**.", ephemeral=True)
+        else:
+            await inter.user.add_roles(role, reason="Role Panel button toggle")
+            # If user picked Baguette or Schnitzel, automatically clean up Stateless
+            if role.name in ("Baguette", "Schnitzel"):
+                role_stateless = discord.utils.get(inter.guild.roles, name="Stateless")
+                if role_stateless and role_stateless in inter.user.roles:
+                    await inter.user.remove_roles(role_stateless, reason="Selected primary community role")
+            await inter.response.send_message(
+                f"✅ Added role **{role.name}**! Your channels have been unlocked.",
+                ephemeral=True,
+            )
+    except Exception as e:
+        await inter.response.send_message(f"❌ Could not update role: {e}", ephemeral=True)
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Grants a community/notification role when a user reacts on the Role Panel."""
+    if not payload.guild_id or (bot.user and payload.user_id == bot.user.id):
+        return
+    if not _is_role_panel_event(payload):
+        return
+
+    emoji_key = str(payload.emoji)
+    rr_map = {**DEFAULT_REACTION_ROLES, **config_mgr.data.get("reaction_roles", {})}
+    role_id_str = rr_map.get(emoji_key)
+    if not role_id_str or not str(role_id_str).isdigit():
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    role = guild.get_role(int(role_id_str))
+    member = payload.member or guild.get_member(payload.user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+    if not role or member.bot:
+        return
+
+    try:
+        if role not in member.roles:
+            await member.add_roles(role, reason="Reaction Role added")
+        if role.name in ("Baguette", "Schnitzel"):
+            role_stateless = discord.utils.get(guild.roles, name="Stateless")
+            if role_stateless and role_stateless in member.roles:
+                await member.remove_roles(role_stateless, reason="Selected primary community role")
+    except Exception as e:
+        logger.warning("Failed adding reaction role %s to %s: %s", role.name, member.display_name, e)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    """Removes a community/notification role when a user removes their reaction on the Role Panel."""
+    if not payload.guild_id or (bot.user and payload.user_id == bot.user.id):
+        return
+    if not _is_role_panel_event(payload):
+        return
+
+    emoji_key = str(payload.emoji)
+    rr_map = {**DEFAULT_REACTION_ROLES, **config_mgr.data.get("reaction_roles", {})}
+    role_id_str = rr_map.get(emoji_key)
+    if not role_id_str or not str(role_id_str).isdigit():
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    role = guild.get_role(int(role_id_str))
+    member = guild.get_member(payload.user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+    if not role or member.bot:
+        return
+
+    try:
+        if role in member.roles:
+            await member.remove_roles(role, reason="Reaction Role removed")
+    except Exception as e:
+        logger.warning("Failed removing reaction role %s from %s: %s", role.name, member.display_name, e)
+
+
+###############################################################################
 # ───────────────────────────── GLOBAL EVENTS ──────────────────────────────── #
 ###############################################################################
 
@@ -1676,7 +1913,13 @@ async def on_ready():
 
     if not bot._web_started:
         try:
-            app = create_web_app(bot, config_mgr, run_twitch_check, apply_community_role_setup)
+            app = create_web_app(
+                bot,
+                config_mgr,
+                run_twitch_check,
+                apply_community_role_setup,
+                post_role_panel,
+            )
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)

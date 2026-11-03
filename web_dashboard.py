@@ -33,6 +33,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "feeds": [],  # List of feed dicts
     "campaign_history": {},  # { "feed_id::game_name": { "active": bool, "last_notified_ts": float, "inactive_streak": int } }
+    "role_panel_messages": ["1567095715807633449"],
+    "reaction_roles": {
+        "🥖": "1221089896257683466",
+        "🥩": "1221089786534563840",
+        "🌍": "1221096152389259325",
+        "🎁": "1499718295211872357",
+    },
 }
 
 
@@ -486,6 +493,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <label>Channel Type</label>
             <select id="new-chan-type" onchange="onNewChanTypeChange()">
               <option value="text">💬 Text Channel (#)</option>
+              <option value="forum">📋 Forum / Thread Board (Builds & Links)</option>
               <option value="voice">🔊 Voice Channel</option>
               <option value="category">📁 New Category</option>
             </select>
@@ -567,6 +575,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="tab-roles" class="tab-content">
       <div class="grid">
         <div>
+          <div class="card">
+            <h2>🎭 Post Reaction & Button Role Panel</h2>
+            <p class="sub">Deploy an interactive Role Selection Panel (with both clickable Buttons and Emoji Reactions for 🥖 Baguette, 🥩 Schnitzel, 🌍 Stateless, and 🎁 Twitch Drops) into any channel.</p>
+            <label>Select Target Channel</label>
+            <select id="role-panel-channel"></select>
+            <div style="margin-top:14px;">
+              <button class="btn" onclick="postRolePanel()">🎭 Post Role Panel to Channel</button>
+            </div>
+          </div>
+
           <div class="card">
             <h2>🏛️ One-Click Community Role Setup</h2>
             <p class="sub">Automatically configures HRE (kanki, grosgul, horvath), Austrian Mod (ostblockpanda), French Mods (mcwalter, caocao), disables @everyone ping spam, and assigns Stateless to roleless members.</p>
@@ -673,7 +691,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function onNewChanTypeChange() {
       const t = document.getElementById("new-chan-type").value;
       document.getElementById("new-chan-cat-box").style.display = t === "category" ? "none" : "block";
-      document.getElementById("new-chan-topic-box").style.display = t === "text" ? "block" : "none";
+      document.getElementById("new-chan-topic-box").style.display = (t === "text" || t === "forum") ? "block" : "none";
       document.getElementById("new-chan-limit-box").style.display = t === "voice" ? "block" : "none";
     }
 
@@ -734,13 +752,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       });
 
       // Populate text channels
-      const cSel = document.getElementById("feed-channel-select");
-      cSel.innerHTML = "";
-      g.channels.filter(c => c.type === "text").forEach(c => {
-        const o = document.createElement("option");
-        o.value = c.id;
-        o.textContent = `#${c.name} (${c.category_name || "No Category"})`;
-        cSel.appendChild(o);
+      const textChanSelects = ["feed-channel-select", "role-panel-channel"];
+      textChanSelects.forEach(selId => {
+        const cSel = document.getElementById(selId);
+        if (!cSel) return;
+        cSel.innerHTML = "";
+        g.channels.filter(c => c.type === "text").forEach(c => {
+          const o = document.createElement("option");
+          o.value = c.id;
+          o.textContent = `#${c.name} (${c.category_name || "No Category"})`;
+          cSel.appendChild(o);
+        });
       });
 
       // Populate categories
@@ -855,7 +877,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         wrap.innerHTML = `<h4>${grp.name} ${delCatBtn}</h4>`;
 
         grp.items.forEach(c => {
-          const icon = c.type === "voice" ? "🔊" : "#";
+          const icon = c.type === "voice" ? "🔊" : (c.type === "forum" ? "📋" : "#");
           const row = document.createElement("div");
           row.className = "chan-item";
 
@@ -1134,6 +1156,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    async function postRolePanel() {
+      try {
+        const g = getCurrentGuild();
+        const cid = document.getElementById("role-panel-channel").value;
+        if (!g || !cid) return;
+        await api("/api/roles/panel", "POST", { guild_id: g.id, channel_id: cid });
+        showToast("🎭 Role Selection Panel posted!");
+        await loadState();
+      } catch (e) {
+        document.getElementById("bot-status").textContent = "Error: " + e.message;
+        showToast(e.message, true);
+      }
+    }
+
     async function applyCommunityRoles() {
       try {
         const g = getCurrentGuild();
@@ -1170,7 +1206,13 @@ def check_auth(request: web.Request) -> bool:
     return key == secret
 
 
-def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops_cb, setup_roles_cb=None) -> web.Application:
+def create_web_app(
+    bot: discord.Client,
+    config_mgr: ConfigManager,
+    trigger_drops_cb,
+    setup_roles_cb=None,
+    post_role_panel_cb=None,
+) -> web.Application:
     app = web.Application()
 
     async def index(request: web.Request) -> web.Response:
@@ -1194,6 +1236,8 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
                     ctype = "text"
                 elif isinstance(c, discord.VoiceChannel):
                     ctype = "voice"
+                elif isinstance(c, discord.ForumChannel):
+                    ctype = "forum"
                 else:
                     continue
                 channels.append(
@@ -1406,6 +1450,14 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
                     user_limit=limit or None,
                     overwrites=overwrites or discord.utils.MISSING,
                 )
+            elif ctype == "forum":
+                topic = (body.get("topic") or "").strip() or None
+                await guild.create_forum(
+                    name=name,
+                    category=category if isinstance(category, discord.CategoryChannel) else None,
+                    topic=topic,
+                    overwrites=overwrites or discord.utils.MISSING,
+                )
             else:
                 topic = (body.get("topic") or "").strip() or None
                 await guild.create_text_channel(
@@ -1508,6 +1560,22 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
         logs = await setup_roles_cb(guild)
         return web.json_response({"ok": True, "logs": logs})
 
+    async def deploy_role_panel(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        guild = bot.get_guild(int(body.get("guild_id") or 0))
+        if not guild or not post_role_panel_cb:
+            return web.json_response({"error": "Guild not found"}, status=404)
+        ch = guild.get_channel(int(body.get("channel_id") or 0))
+        if not isinstance(ch, discord.TextChannel):
+            return web.json_response({"error": "Text channel not found"}, status=404)
+        try:
+            msg_id = await post_role_panel_cb(ch)
+            return web.json_response({"ok": True, "message_id": str(msg_id)})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
     app.router.add_get("/", index)
     app.router.add_get("/api/state", get_state)
     app.router.add_post("/api/feeds", add_feed)
@@ -1523,5 +1591,6 @@ def create_web_app(bot: discord.Client, config_mgr: ConfigManager, trigger_drops
     app.router.add_delete("/api/lobbies/{id}", delete_lobby)
     app.router.add_post("/api/roles/member", member_role_toggle)
     app.router.add_post("/api/roles/setup_community", run_setup_community)
+    app.router.add_post("/api/roles/panel", deploy_role_panel)
 
     return app
