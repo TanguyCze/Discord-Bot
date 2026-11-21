@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 from discord.opus import load_opus, is_loaded
 
 from web_dashboard import ConfigManager, create_web_app
+from mod_and_logs import install_log_buffer, setup_mod_and_logs
+from rust_tracker import setup_rust_tracker
 
 ###############################################################################
 # ───────────────────────────────── LOGGING ────────────────────────────────── #
@@ -28,6 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+log_buffer = install_log_buffer(maxlen=250)
 logger = logging.getLogger("DiscordBot")
 
 ###############################################################################
@@ -148,6 +151,7 @@ bot.current_song: Dict[int, dict]              = {}
 bot.looping: Dict[int, bool]                   = {}
 bot.volumes: Dict[int, float]                  = {}
 bot.dynamic_channels: Set[int]                 = set()
+bot.dynamic_channel_owners: Dict[int, int]     = {}
 bot.auto_leave_tasks: Dict[int, asyncio.Task]  = {}
 bot.music_locks: Dict[int, asyncio.Lock]       = {}
 bot._synced: bool                              = False
@@ -206,11 +210,31 @@ def format_duration(seconds: Optional[ Union[int, float] ]) -> str:
     return f"{mins}:{secs:02d}"
 
 
+async def resolve_spotify_query(query: str) -> str:
+    """Converts a Spotify track URL into a clean YouTube search query via Spotify's public oEmbed API."""
+    if "open.spotify.com/" not in query:
+        return query
+    try:
+        oembed_url = f"https://open.spotify.com/oembed?url={quote(query, safe='')}"
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(oembed_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    title = (data.get("title") or "").strip()
+                    if title:
+                        return f"{title} audio"
+    except Exception as e:
+        logger.warning("Spotify oEmbed lookup failed for %r: %s", query, e)
+    return query
+
+
 async def get_song_info(query: str, requester: Optional[str] = None) -> Optional[dict]:
     try:
+        clean_query = await resolve_spotify_query(query)
         loop = asyncio.get_running_loop()
         with YoutubeDL(YDL_OPTS) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(clean_query, download=False))
 
         if not info:
             return None
@@ -232,8 +256,8 @@ async def get_song_info(query: str, requester: Optional[str] = None) -> Optional
         return {
             "title": info.get("title", "Unknown"),
             "stream_url": stream_url,
-            "webpage_url": info.get("webpage_url") or query,
-            "query": query,
+            "webpage_url": info.get("webpage_url") or clean_query,
+            "query": clean_query,
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
             "user_agent": user_agent,
@@ -243,6 +267,49 @@ async def get_song_info(query: str, requester: Optional[str] = None) -> Optional
     except Exception as e:
         logger.error("❌ YTDL Error for query %r: %s", query, e)
         return None
+
+
+async def get_songs_info(query: str, requester: Optional[str] = None, max_playlist: int = 25) -> List[dict]:
+    """Extracts either a YouTube playlist (up to max_playlist items) or a single track / Spotify link."""
+    is_yt_playlist = ("youtube.com" in query or "youtu.be" in query) and ("list=" in query or "/playlist" in query)
+    if is_yt_playlist:
+        try:
+            flat_opts = dict(YDL_OPTS)
+            flat_opts["noplaylist"] = False
+            flat_opts["extract_flat"] = "in_playlist"
+            flat_opts["playlistend"] = max_playlist
+            loop = asyncio.get_running_loop()
+            with YoutubeDL(flat_opts) as ydl:
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+            entries = [e for e in ((info or {}).get("entries") or []) if e]
+            if len(entries) > 1:
+                songs: List[dict] = []
+                for e in entries[:max_playlist]:
+                    vid_url = e.get("url") or e.get("webpage_url") or ""
+                    if vid_url and not vid_url.startswith("http"):
+                        vid_url = f"https://www.youtube.com/watch?v={vid_url}"
+                    if not vid_url:
+                        continue
+                    songs.append(
+                        {
+                            "title": e.get("title") or "Unknown Track",
+                            "stream_url": "",  # Lazily resolved right before playback in play_next()
+                            "webpage_url": vid_url,
+                            "query": vid_url,
+                            "duration": e.get("duration"),
+                            "thumbnail": e.get("thumbnail"),
+                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                            "requester": requester,
+                            "extracted_at": 0.0,
+                        }
+                    )
+                if songs:
+                    return songs
+        except Exception as e:
+            logger.warning("Playlist flat extraction failed, falling back to single track: %s", e)
+
+    single = await get_song_info(query, requester=requester)
+    return [single] if single else []
 
 
 async def cleanup_voice_client(guild: discord.Guild) -> None:
@@ -381,14 +448,36 @@ async def delayed_auto_leave(guild: discord.Guild) -> None:
 ###############################################################################
 
 
-async def _send_reply(ctx_or_inter: Union[commands.Context, discord.Interaction], content: Optional[str] = None, *, embed: Optional[discord.Embed] = None) -> None:
+def build_music_controls_view() -> discord.ui.View:
+    """Stateless interactive music player controls attached to Play / Now Playing embeds."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.primary, label="Pause / Resume", emoji="⏯️", custom_id="music_ctrl:pause"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Skip", emoji="⏭️", custom_id="music_ctrl:skip"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Loop", emoji="🔁", custom_id="music_ctrl:loop"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Shuffle", emoji="🔀", custom_id="music_ctrl:shuffle"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.danger, label="Stop", emoji="⏹️", custom_id="music_ctrl:stop"))
+    return view
+
+
+async def _send_reply(
+    ctx_or_inter: Union[commands.Context, discord.Interaction],
+    content: Optional[str] = None,
+    *,
+    embed: Optional[discord.Embed] = None,
+    view: Optional[discord.ui.View] = None,
+) -> None:
+    kwargs = {}
+    if embed is not None:
+        kwargs["embed"] = embed
+    if view is not None:
+        kwargs["view"] = view
     if isinstance(ctx_or_inter, discord.Interaction):
         if ctx_or_inter.response.is_done():
-            await ctx_or_inter.followup.send(content=content, embed=embed)
+            await ctx_or_inter.followup.send(content=content, **kwargs)
         else:
-            await ctx_or_inter.response.send_message(content=content, embed=embed)
+            await ctx_or_inter.response.send_message(content=content, **kwargs)
     else:
-        await ctx_or_inter.send(content=content, embed=embed)
+        await ctx_or_inter.send(content=content, **kwargs)
 
 
 async def _play_logic(ctx_or_inter: Union[commands.Context, discord.Interaction], query: str) -> None:
@@ -408,21 +497,128 @@ async def _play_logic(ctx_or_inter: Union[commands.Context, discord.Interaction]
         user = getattr(ctx_or_inter, "author", getattr(ctx_or_inter, "user", None))
         requester = user.display_name if user else None
 
-        song = await get_song_info(query, requester=requester)
-        if not song:
-            return await _send_reply(ctx_or_inter, "❌ Could not find track.")
+        songs = await get_songs_info(query, requester=requester)
+        if not songs:
+            return await _send_reply(ctx_or_inter, "❌ Could not find track or playlist.")
 
-        bot.song_queue[gid].append(song)
+        bot.song_queue[gid].extend(songs)
         cancel_auto_leave(gid)
 
-        duration_str = format_duration(song.get("duration"))
-        await _send_reply(
-            ctx_or_inter,
-            f"🎵 Added to queue: **{song['title']}** (`{duration_str}`)",
-        )
+        if len(songs) == 1:
+            song = songs[0]
+            duration_str = format_duration(song.get("duration"))
+            embed = discord.Embed(
+                title="🎵 Added to Queue",
+                description=f"**{song['title']}** (`{duration_str}`)",
+                color=0x1DB954,
+            )
+            if song.get("thumbnail"):
+                embed.set_thumbnail(url=song["thumbnail"])
+            if requester:
+                embed.set_footer(text=f"Requested by {requester}")
+            await _send_reply(ctx_or_inter, embed=embed, view=build_music_controls_view())
+        else:
+            embed = discord.Embed(
+                title="📜 Playlist Added to Queue",
+                description=f"Queued **{len(songs)}** tracks! First up: **{songs[0]['title']}**",
+                color=0x1DB954,
+            )
+            await _send_reply(ctx_or_inter, embed=embed, view=build_music_controls_view())
 
         if not vc.is_playing() and not vc.is_paused():
             await play_next(ctx_or_inter.guild)
+
+
+async def music_control_action(guild_id: int, action: str, payload: dict) -> dict:
+    """Allows the Web UI Music Player tab to inspect state and control playback."""
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return {"error": "Server not found"}
+
+    vc = guild.voice_client
+    bot.song_queue.setdefault(guild_id, [])
+    bot.looping.setdefault(guild_id, False)
+    bot.volumes.setdefault(guild_id, DEFAULT_VOLUME)
+
+    if action == "play":
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return {"error": "Song URL or search query is required"}
+        if not vc or not vc.is_connected():
+            vc_cid = str(payload.get("voice_channel_id") or "").strip()
+            target_vc = guild.get_channel(int(vc_cid)) if vc_cid.isdigit() else None
+            if not isinstance(target_vc, discord.VoiceChannel):
+                # Auto-pick first voice channel with a human in it
+                target_vc = next(
+                    (c for c in guild.voice_channels if any(not m.bot for m in c.members)),
+                    None,
+                )
+            if not target_vc:
+                return {"error": "Join a voice channel or select a Voice Channel in the dropdown first."}
+            vc = await target_vc.connect(timeout=20.0, self_deaf=True)
+
+        async with get_music_lock(guild_id):
+            songs = await get_songs_info(query, requester="Web Dashboard")
+            if not songs:
+                return {"error": "Could not find track or playlist"}
+            bot.song_queue[guild_id].extend(songs)
+            cancel_auto_leave(guild_id)
+            if not vc.is_playing() and not vc.is_paused():
+                await play_next(guild)
+        return {"ok": True, "added": len(songs)}
+
+    if action == "pause":
+        if vc and vc.is_playing():
+            vc.pause()
+        elif vc and vc.is_paused():
+            vc.resume()
+        return {"ok": True}
+
+    if action == "skip":
+        if vc and (vc.is_playing() or vc.is_paused()):
+            if bot.looping.get(guild_id):
+                bot.current_song.pop(guild_id, None)
+            vc.stop()
+        return {"ok": True}
+
+    if action == "stop":
+        bot.song_queue[guild_id].clear()
+        bot.current_song.pop(guild_id, None)
+        bot.looping[guild_id] = False
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        return {"ok": True}
+
+    if action == "leave":
+        await cleanup_voice_client(guild)
+        return {"ok": True}
+
+    if action == "loop":
+        bot.looping[guild_id] = not bot.looping.get(guild_id, False)
+        return {"ok": True, "looping": bot.looping[guild_id]}
+
+    if action == "shuffle":
+        q = bot.song_queue.get(guild_id, [])
+        if len(q) >= 2:
+            random.shuffle(q)
+        return {"ok": True}
+
+    if action == "volume":
+        pct = max(1, min(200, int(payload.get("percent") or 20)))
+        vol = pct / 100.0
+        bot.volumes[guild_id] = vol
+        if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = vol
+        return {"ok": True, "volume": pct}
+
+    if action == "remove":
+        idx = int(payload.get("index", -1))
+        q = bot.song_queue.get(guild_id, [])
+        if 0 <= idx < len(q):
+            q.pop(idx)
+        return {"ok": True}
+
+    return {"error": f"Unknown action: {action}"}
 
 
 # ─── Slash Music Commands ───
@@ -605,7 +801,7 @@ async def slash_nowplaying(inter: discord.Interaction):
             embed.add_field(name="👤 Requested by", value=song["requester"], inline=True)
         if song.get("thumbnail"):
             embed.set_thumbnail(url=song["thumbnail"])
-        await inter.response.send_message(embed=embed)
+        await inter.response.send_message(embed=embed, view=build_music_controls_view())
     else:
         await inter.response.send_message("❌ Nothing is playing.")
 
@@ -1592,72 +1788,105 @@ DEFAULT_REACTION_ROLES: Dict[str, str] = {
 WELCOME_ROLE_CHANNEL_ID = 575643151268708354  # #lets-go-brandon
 
 
-async def post_role_panel(channel: discord.TextChannel) -> int:
-    """Posts an interactive Button + Emoji Reaction Role Selection Panel to the given channel."""
+BUTTON_STYLE_MAP = {
+    "primary": discord.ButtonStyle.primary,
+    "secondary": discord.ButtonStyle.secondary,
+    "success": discord.ButtonStyle.success,
+    "danger": discord.ButtonStyle.danger,
+}
+
+
+async def post_role_panel(
+    channel: discord.TextChannel,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    items: Optional[List[dict]] = None,
+) -> int:
+    """Posts an interactive Button + Emoji Reaction Role Selection Panel (default or custom from Web UI)."""
     guild = channel.guild
-    role_baguette = discord.utils.get(guild.roles, name="Baguette")
-    role_schnitzel = discord.utils.get(guild.roles, name="Schnitzel")
-    role_stateless = discord.utils.get(guild.roles, name="Stateless")
-    role_drops = discord.utils.get(guild.roles, name="twitch drop")
 
-    id_baguette = str(role_baguette.id) if role_baguette else DEFAULT_REACTION_ROLES["🥖"]
-    id_schnitzel = str(role_schnitzel.id) if role_schnitzel else DEFAULT_REACTION_ROLES["🥩"]
-    id_stateless = str(role_stateless.id) if role_stateless else DEFAULT_REACTION_ROLES["🌍"]
-    id_drops = str(role_drops.id) if role_drops else DEFAULT_REACTION_ROLES["🎁"]
+    if not items:
+        role_baguette = discord.utils.get(guild.roles, name="Baguette")
+        role_schnitzel = discord.utils.get(guild.roles, name="Schnitzel")
+        role_stateless = discord.utils.get(guild.roles, name="Stateless")
+        role_drops = discord.utils.get(guild.roles, name="twitch drop")
 
-    embed = discord.Embed(
-        title="🎭 Choose Your Community & Notification Roles",
-        description=(
-            f"Welcome to **{guild.name}**! Click the **buttons** or **react with the emojis** below to unlock your community channels:\n\n"
-            "🥖 **Baguette (French Community)**\n"
-            "Unlock `#baguette-chat`, `#melting-pot`, and `🔊 Baguette Voice`.\n\n"
-            "🥩 **Schnitzel (Austrian Community)**\n"
-            "Unlock `#schnitzel-chat`, `#melting-pot`, and `🔊 Schnitzel Voice`.\n\n"
-            "🌍 **Stateless (International / English)**\n"
-            "Unlock `#melting-pot` to hang out with everyone.\n\n"
-            "🎁 **Twitch Drops Alerts**\n"
-            "Get access & notifications for active Twitch Drops campaigns in `#twitch`."
-        ),
-        color=0x5865F2,
-    )
+        items = [
+            {
+                "emoji": "🥖",
+                "role_id": str(role_baguette.id) if role_baguette else DEFAULT_REACTION_ROLES["🥖"],
+                "label": "Baguette (FR)",
+                "style": "primary",
+                "desc": "Unlock `#baguette-chat`, `#melting-pot`, and `🔊 Baguette Voice`.",
+            },
+            {
+                "emoji": "🥩",
+                "role_id": str(role_schnitzel.id) if role_schnitzel else DEFAULT_REACTION_ROLES["🥩"],
+                "label": "Schnitzel (AT)",
+                "style": "danger",
+                "desc": "Unlock `#schnitzel-chat`, `#melting-pot`, and `🔊 Schnitzel Voice`.",
+            },
+            {
+                "emoji": "🌍",
+                "role_id": str(role_stateless.id) if role_stateless else DEFAULT_REACTION_ROLES["🌍"],
+                "label": "Stateless (INT)",
+                "style": "secondary",
+                "desc": "Unlock `#melting-pot` to hang out with everyone.",
+            },
+            {
+                "emoji": "🎁",
+                "role_id": str(role_drops.id) if role_drops else DEFAULT_REACTION_ROLES["🎁"],
+                "label": "Twitch Drops",
+                "style": "success",
+                "desc": "Get access & notifications for active Twitch Drops campaigns in `#twitch`.",
+            },
+        ]
+
+    panel_title = (title or "").strip() or "🎭 Choose Your Community & Notification Roles"
+    if (description or "").strip():
+        panel_desc = description.strip()
+    else:
+        desc_lines = [
+            f"Welcome to **{guild.name}**! Click the **buttons** or **react with the emojis** below to toggle your roles:\n"
+        ]
+        for it in items:
+            em = (it.get("emoji") or "🎭").strip()
+            lbl = (it.get("label") or "Role").strip()
+            d_txt = (it.get("desc") or "").strip()
+            if d_txt:
+                desc_lines.append(f"{em} **{lbl}**\n{d_txt}\n")
+            else:
+                desc_lines.append(f"{em} **{lbl}**")
+        panel_desc = "\n".join(desc_lines)
+
+    embed = discord.Embed(title=panel_title, description=panel_desc, color=0x5865F2)
     embed.set_footer(text="Click a button or react below at any time to add or remove a role!")
 
     view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            style=discord.ButtonStyle.primary,
-            label="Baguette (FR)",
-            emoji="🥖",
-            custom_id=f"rr_role:{id_baguette}",
+    rr_map = config_mgr.data.setdefault("reaction_roles", {})
+    emojis_to_react: List[str] = []
+
+    for it in items[:25]:
+        rid = str(it.get("role_id") or "").strip()
+        if not rid.isdigit():
+            continue
+        em = (it.get("emoji") or "").strip() or None
+        lbl = (it.get("label") or "Toggle Role").strip()[:80]
+        st = BUTTON_STYLE_MAP.get(str(it.get("style") or "primary").lower(), discord.ButtonStyle.primary)
+        view.add_item(
+            discord.ui.Button(
+                style=st,
+                label=lbl,
+                emoji=em,
+                custom_id=f"rr_role:{rid}",
+            )
         )
-    )
-    view.add_item(
-        discord.ui.Button(
-            style=discord.ButtonStyle.danger,
-            label="Schnitzel (AT)",
-            emoji="🥩",
-            custom_id=f"rr_role:{id_schnitzel}",
-        )
-    )
-    view.add_item(
-        discord.ui.Button(
-            style=discord.ButtonStyle.secondary,
-            label="Stateless (INT)",
-            emoji="🌍",
-            custom_id=f"rr_role:{id_stateless}",
-        )
-    )
-    view.add_item(
-        discord.ui.Button(
-            style=discord.ButtonStyle.success,
-            label="Twitch Drops",
-            emoji="🎁",
-            custom_id=f"rr_role:{id_drops}",
-        )
-    )
+        if em:
+            rr_map[em] = rid
+            emojis_to_react.append(em)
 
     msg = await channel.send(embed=embed, view=view)
-    for emoji_char in ("🥖", "🥩", "🌍", "🎁"):
+    for emoji_char in emojis_to_react[:15]:
         try:
             await msg.add_reaction(emoji_char)
         except Exception:
@@ -1666,11 +1895,6 @@ async def post_role_panel(channel: discord.TextChannel) -> int:
     panel_msgs = config_mgr.data.setdefault("role_panel_messages", [])
     if str(msg.id) not in panel_msgs:
         panel_msgs.append(str(msg.id))
-    rr_map = config_mgr.data.setdefault("reaction_roles", {})
-    rr_map["🥖"] = id_baguette
-    rr_map["🥩"] = id_schnitzel
-    rr_map["🌍"] = id_stateless
-    rr_map["🎁"] = id_drops
     config_mgr.save()
     return msg.id
 
@@ -1705,42 +1929,196 @@ def _is_role_panel_event(payload: discord.RawReactionActionEvent) -> bool:
     return False
 
 
+def build_voice_room_controls(channel_id: int) -> discord.ui.View:
+    """Interactive buttons posted inside a newly spawned Join-to-Create voice channel."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.danger, label="Lock Room", emoji="🔒", custom_id=f"vc_ctrl:lock:{channel_id}"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.success, label="Unlock Room", emoji="🔓", custom_id=f"vc_ctrl:unlock:{channel_id}"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Duo (2)", emoji="👥", custom_id=f"vc_ctrl:limit2:{channel_id}"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Squad (5)", emoji="🎮", custom_id=f"vc_ctrl:limit5:{channel_id}"))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Unlimited", emoji="♾️", custom_id=f"vc_ctrl:unlimit:{channel_id}"))
+    return view
+
+
+@bot.tree.command(name="room", description="Control your Join-to-Create temporary voice room (lock, unlock, rename, limit, kick)")
+@app_commands.describe(
+    action="Action to perform on your temporary voice room",
+    value="New room name (for rename) or user limit 0-99 (for limit)",
+    member="Member to kick from your room (for kick)",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="🔒 Lock Room", value="lock"),
+        app_commands.Choice(name="🔓 Unlock Room", value="unlock"),
+        app_commands.Choice(name="✏️ Rename Room", value="rename"),
+        app_commands.Choice(name="👥 Set User Limit", value="limit"),
+        app_commands.Choice(name="👢 Kick Member from Room", value="kick"),
+    ]
+)
+async def slash_room(
+    inter: discord.Interaction,
+    action: app_commands.Choice[str],
+    value: Optional[str] = None,
+    member: Optional[discord.Member] = None,
+):
+    if not inter.guild or not isinstance(inter.user, discord.Member):
+        return await inter.response.send_message("❌ Server only.", ephemeral=True)
+    if not inter.user.voice or not inter.user.voice.channel:
+        return await inter.response.send_message("❌ You must be inside your temporary voice room.", ephemeral=True)
+
+    vc_chan = inter.user.voice.channel
+    owner_id = bot.dynamic_channel_owners.get(vc_chan.id)
+    is_allowed = (
+        (owner_id == inter.user.id)
+        or inter.user.guild_permissions.administrator
+        or inter.user.guild_permissions.manage_channels
+    )
+    if vc_chan.id not in bot.dynamic_channels or not is_allowed:
+        return await inter.response.send_message("❌ You can only control a temporary voice room you created.", ephemeral=True)
+
+    act = action.value
+    try:
+        if act == "lock":
+            await vc_chan.set_permissions(inter.guild.default_role, connect=False)
+            await inter.response.send_message("🔒 Room **locked**! Nobody else can join.", ephemeral=True)
+        elif act == "unlock":
+            await vc_chan.set_permissions(inter.guild.default_role, connect=None)
+            await inter.response.send_message("🔓 Room **unlocked**!", ephemeral=True)
+        elif act == "rename":
+            if not value or not value.strip():
+                return await inter.response.send_message("❌ Provide a new name in `value`.", ephemeral=True)
+            await vc_chan.edit(name=value.strip()[:95])
+            await inter.response.send_message(f"✏️ Room renamed to **{value.strip()[:95]}**.", ephemeral=True)
+        elif act == "limit":
+            lim = int(value) if value and value.strip().isdigit() else 0
+            lim = max(0, min(99, lim))
+            await vc_chan.edit(user_limit=lim)
+            lbl = "Unlimited" if lim == 0 else str(lim)
+            await inter.response.send_message(f"👥 User limit set to **{lbl}**.", ephemeral=True)
+        elif act == "kick":
+            if not member or not member.voice or member.voice.channel != vc_chan:
+                return await inter.response.send_message("❌ That member is not in your voice room.", ephemeral=True)
+            await member.move_to(None)
+            await inter.response.send_message(f"👢 Disconnected **{member.display_name}** from your room.", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Failed updating room: {e}", ephemeral=True)
+
+
 @bot.event
 async def on_interaction(inter: discord.Interaction):
-    """Handles stateless persistent Role Panel button clicks across restarts."""
+    """Handles stateless persistent button clicks: Role Panels, Music Controls, and Voice Room Controls."""
     if inter.type != discord.InteractionType.component or not inter.data:
         return
     custom_id = str(inter.data.get("custom_id") or "")
-    if not custom_id.startswith("rr_role:"):
-        return
 
     if not inter.guild or not isinstance(inter.user, discord.Member):
-        return await inter.response.send_message("❌ Server only.", ephemeral=True)
-
-    role_id_str = custom_id.split(":", 1)[1].strip()
-    if not role_id_str.isdigit():
+        if custom_id.startswith(("rr_role:", "music_ctrl:", "vc_ctrl:")):
+            await inter.response.send_message("❌ Server only.", ephemeral=True)
         return
-    role = inter.guild.get_role(int(role_id_str))
-    if not role:
-        return await inter.response.send_message("❌ Role not found on this server.", ephemeral=True)
 
-    try:
-        if role in inter.user.roles:
-            await inter.user.remove_roles(role, reason="Role Panel button toggle")
-            await inter.response.send_message(f"➖ Removed role **{role.name}**.", ephemeral=True)
-        else:
-            await inter.user.add_roles(role, reason="Role Panel button toggle")
-            # If user picked Baguette or Schnitzel, automatically clean up Stateless
-            if role.name in ("Baguette", "Schnitzel"):
-                role_stateless = discord.utils.get(inter.guild.roles, name="Stateless")
-                if role_stateless and role_stateless in inter.user.roles:
-                    await inter.user.remove_roles(role_stateless, reason="Selected primary community role")
+    # 1. Reaction / Button Role Toggle
+    if custom_id.startswith("rr_role:"):
+        role_id_str = custom_id.split(":", 1)[1].strip()
+        if not role_id_str.isdigit():
+            return
+        role = inter.guild.get_role(int(role_id_str))
+        if not role:
+            return await inter.response.send_message("❌ Role not found on this server.", ephemeral=True)
+
+        try:
+            if role in inter.user.roles:
+                await inter.user.remove_roles(role, reason="Role Panel button toggle")
+                await inter.response.send_message(f"➖ Removed role **{role.name}**.", ephemeral=True)
+            else:
+                await inter.user.add_roles(role, reason="Role Panel button toggle")
+                if role.name in ("Baguette", "Schnitzel"):
+                    role_stateless = discord.utils.get(inter.guild.roles, name="Stateless")
+                    if role_stateless and role_stateless in inter.user.roles:
+                        await inter.user.remove_roles(role_stateless, reason="Selected primary community role")
+                await inter.response.send_message(
+                    f"✅ Added role **{role.name}**! Your channels have been unlocked.",
+                    ephemeral=True,
+                )
+        except Exception as e:
+            await inter.response.send_message(f"❌ Could not update role: {e}", ephemeral=True)
+        return
+
+    # 2. Interactive Music Player Controls
+    if custom_id.startswith("music_ctrl:"):
+        act = custom_id.split(":", 1)[1]
+        gid = inter.guild.id
+        vc = inter.guild.voice_client
+        if act == "pause":
+            if vc and vc.is_playing():
+                vc.pause()
+                await inter.response.send_message("⏸️ Paused.", ephemeral=True)
+            elif vc and vc.is_paused():
+                vc.resume()
+                await inter.response.send_message("▶️ Resumed.", ephemeral=True)
+            else:
+                await inter.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        elif act == "skip":
+            if vc and (vc.is_playing() or vc.is_paused()):
+                if bot.looping.get(gid):
+                    bot.current_song.pop(gid, None)
+                vc.stop()
+                await inter.response.send_message("⏭️ Skipped!", ephemeral=True)
+            else:
+                await inter.response.send_message("❌ Nothing to skip.", ephemeral=True)
+        elif act == "loop":
+            new_state = not bot.looping.get(gid, False)
+            bot.looping[gid] = new_state
             await inter.response.send_message(
-                f"✅ Added role **{role.name}**! Your channels have been unlocked.",
+                "🔁 Loop **ON**" if new_state else "➡️ Loop **OFF**",
                 ephemeral=True,
             )
-    except Exception as e:
-        await inter.response.send_message(f"❌ Could not update role: {e}", ephemeral=True)
+        elif act == "shuffle":
+            q = bot.song_queue.get(gid, [])
+            if len(q) >= 2:
+                random.shuffle(q)
+                await inter.response.send_message("🔀 Queue shuffled!", ephemeral=True)
+            else:
+                await inter.response.send_message("❌ Need at least 2 tracks in queue to shuffle.", ephemeral=True)
+        elif act == "stop":
+            if gid in bot.song_queue:
+                bot.song_queue[gid].clear()
+            bot.current_song.pop(gid, None)
+            bot.looping[gid] = False
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            await inter.response.send_message("⏹️ Stopped music and cleared queue.", ephemeral=True)
+        return
+
+    # 3. Dynamic Voice Room Controls
+    if custom_id.startswith("vc_ctrl:"):
+        parts = custom_id.split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            return
+        act, cid = parts[1], int(parts[2])
+        vc_chan = inter.guild.get_channel(cid)
+        if not isinstance(vc_chan, discord.VoiceChannel):
+            return await inter.response.send_message("❌ Voice room no longer exists.", ephemeral=True)
+        owner_id = bot.dynamic_channel_owners.get(cid)
+        if owner_id != inter.user.id and not inter.user.guild_permissions.administrator:
+            return await inter.response.send_message("❌ Only the room creator or an Admin can use these controls.", ephemeral=True)
+        try:
+            if act == "lock":
+                await vc_chan.set_permissions(inter.guild.default_role, connect=False)
+                await inter.response.send_message("🔒 Room **locked**!", ephemeral=True)
+            elif act == "unlock":
+                await vc_chan.set_permissions(inter.guild.default_role, connect=None)
+                await inter.response.send_message("🔓 Room **unlocked**!", ephemeral=True)
+            elif act == "limit2":
+                await vc_chan.edit(user_limit=2)
+                await inter.response.send_message("👥 Room limit set to **2 (Duo)**.", ephemeral=True)
+            elif act == "limit5":
+                await vc_chan.edit(user_limit=5)
+                await inter.response.send_message("🎮 Room limit set to **5 (Squad)**.", ephemeral=True)
+            elif act == "unlimit":
+                await vc_chan.edit(user_limit=0)
+                await inter.response.send_message("♾️ Room limit removed (**Unlimited**).", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Failed updating voice room: {e}", ephemeral=True)
 
 
 @bot.event
@@ -1876,7 +2254,18 @@ async def on_voice_state_update(
                 overwrites=overwrites,
             )
             bot.dynamic_channels.add(chan.id)
+            bot.dynamic_channel_owners[chan.id] = member.id
             await member.move_to(chan)
+            # Post interactive Voice Room Control Panel in the voice channel's built-in text chat
+            try:
+                vc_embed = discord.Embed(
+                    title=f"🔊 {member.display_name}'s Voice Room Controls",
+                    description="Use the buttons below or `/room` to lock, unlock, rename, or limit your room.",
+                    color=0x5865F2,
+                )
+                await chan.send(embed=vc_embed, view=build_voice_room_controls(chan.id), silent=True)
+            except Exception:
+                pass
         except Exception as e:
             logger.error("Lobby dynamic channel error: %s", e)
             if chan and len([m for m in chan.members if not m.bot]) == 0:
@@ -1885,6 +2274,7 @@ async def on_voice_state_update(
                 except Exception:
                     pass
                 bot.dynamic_channels.discard(chan.id)
+                bot.dynamic_channel_owners.pop(chan.id, None)
 
     # 2. Leave Dynamic Channel -> Delete if no human members remain
     if before.channel and before.channel.id in bot.dynamic_channels:
@@ -1898,6 +2288,7 @@ async def on_voice_state_update(
                 logger.warning("Failed deleting dynamic channel %s: %s", before.channel.id, e)
             finally:
                 bot.dynamic_channels.discard(before.channel.id)
+                bot.dynamic_channel_owners.pop(before.channel.id, None)
 
     # 3. Auto-leave music voice channel if all humans left
     vc = member.guild.voice_client
@@ -1905,6 +2296,10 @@ async def on_voice_state_update(
         human_members = [m for m in vc.channel.members if not m.bot]
         if len(human_members) == 0:
             schedule_auto_leave(member.guild)
+
+
+setup_mod_and_logs(bot, config_mgr)
+check_rust_servers, refresh_rust_servers = setup_rust_tracker(bot, config_mgr)
 
 
 @bot.event
@@ -1919,6 +2314,9 @@ async def on_ready():
                 run_twitch_check,
                 apply_community_role_setup,
                 post_role_panel,
+                music_control_cb=music_control_action,
+                refresh_rust_cb=refresh_rust_servers,
+                log_buffer=log_buffer,
             )
             runner = web.AppRunner(app)
             await runner.setup()
@@ -1932,6 +2330,10 @@ async def on_ready():
     if not check_twitch_campaigns.is_running():
         check_twitch_campaigns.start()
         logger.info("✅ Anti-Spam Twitch Drops Feed Engine started.")
+
+    if not check_rust_servers.is_running():
+        check_rust_servers.start()
+        logger.info("☢️ Rust BattleMetrics Server & Wipe Tracker started.")
 
     if not bot._synced:
         if TEST_GUILD_ID:

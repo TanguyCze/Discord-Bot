@@ -40,6 +40,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "🌍": "1221096152389259325",
         "🎁": "1499718295211872357",
     },
+    "mod_settings": {
+        "mod_log_channel_id": "1573697048912338944",
+        "welcome_channel_id": "",
+        "welcome_message": "Welcome {mention} to **{server}**! Head over to <#575643151268708354> to pick your community role (🥖 French, 🥩 Austrian, or 🌍 International).",
+        "anti_invite": False,
+        "max_mentions": 6,
+        "banned_words": [],
+    },
+    "rust_tracker": {
+        "channel_id": "",
+        "message_id": None,
+        "servers": [],
+    },
 }
 
 
@@ -374,10 +387,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <div class="container">
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('drops', this)">🎁 Custom Drops Feeds & Anti-Spam</button>
-      <button class="tab-btn" onclick="switchTab('channels', this)">🛠️ Channel & Category Manager</button>
-      <button class="tab-btn" onclick="switchTab('roles', this)">👥 Roles & Community Manager</button>
-      <button class="tab-btn" onclick="switchTab('lobbies', this)">🔊 Join-to-Create Lobbies</button>
+      <button class="tab-btn active" onclick="switchTab('drops', this)">🎁 Drops Feeds</button>
+      <button class="tab-btn" onclick="switchTab('channels', this)">🛠️ Channels & Perms</button>
+      <button class="tab-btn" onclick="switchTab('roles', this)">👥 Roles & Panel Builder</button>
+      <button class="tab-btn" onclick="switchTab('music', this)">🎵 Music & Voice</button>
+      <button class="tab-btn" onclick="switchTab('rust', this)">☢️ Rust Tracker</button>
+      <button class="tab-btn" onclick="switchTab('mod', this)">🛡️ Mod & Live Logs</button>
+      <button class="tab-btn" onclick="switchTab('lobbies', this)">🔊 Voice Lobbies</button>
     </div>
 
     <!-- TAB 1: DROPS FEEDS & ANTI-SPAM -->
@@ -530,6 +546,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <button class="btn" onclick="createChannel()">➕ Create Channel</button>
             </div>
           </div>
+
+          <div class="card">
+            <h2>🔐 Channel Permissions Quick-Editor</h2>
+            <p class="sub">Lock/unlock any existing channel for @everyone or grant/revoke access for a specific Role or Member.</p>
+            <label>Select Channel</label>
+            <select id="perm-channel-select"></select>
+            <label>Permission Action</label>
+            <select id="perm-action" onchange="document.getElementById('perm-target-box').style.display = (this.value === 'grant_role' || this.value === 'revoke_role') ? 'block' : 'none'">
+              <option value="make_private">🔒 Make Private (Hide from @everyone)</option>
+              <option value="make_public">🌍 Make Public (Visible to @everyone)</option>
+              <option value="lock_chat">🔇 Lock Chat (Read-Only for @everyone)</option>
+              <option value="unlock_chat">💬 Unlock Chat (Allow @everyone to send)</option>
+              <option value="grant_role">➕ Grant Role Access to Channel</option>
+              <option value="revoke_role">➖ Revoke Role Access from Channel</option>
+            </select>
+            <div id="perm-target-box" style="display:none;">
+              <label>Select Role</label>
+              <select id="perm-role-select"></select>
+            </div>
+            <div style="margin-top:14px;">
+              <button class="btn btn-success" onclick="applyChannelPerm()">🔐 Apply Permission</button>
+            </div>
+          </div>
         </div>
 
         <div>
@@ -576,12 +615,33 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="grid">
         <div>
           <div class="card">
-            <h2>🎭 Post Reaction & Button Role Panel</h2>
-            <p class="sub">Deploy an interactive Role Selection Panel (with both clickable Buttons and Emoji Reactions for 🥖 Baguette, 🥩 Schnitzel, 🌍 Stateless, and 🎁 Twitch Drops) into any channel.</p>
-            <label>Select Target Channel</label>
+            <h2>🎭 Custom Reaction & Button Role Panel Builder</h2>
+            <p class="sub">Pick any channel, customize the title/description, and add any Emoji + Role buttons you want—or leave the list empty to deploy the default French / Austrian / Stateless / Drops panel.</p>
+            <label>Target Channel</label>
             <select id="role-panel-channel"></select>
-            <div style="margin-top:14px;">
-              <button class="btn" onclick="postRolePanel()">🎭 Post Role Panel to Channel</button>
+            <label>Panel Title (Optional)</label>
+            <input type="text" id="rp-title" placeholder="🎭 Choose Your Community & Game Roles" />
+            <label>Panel Description (Optional — auto-generated if empty)</label>
+            <textarea id="rp-desc" rows="2" placeholder="Click the buttons or react below to toggle your roles!"></textarea>
+
+            <label>Add Custom Role Button / Reaction</label>
+            <div class="row" style="flex-wrap:wrap;">
+              <input type="text" id="rp-emoji" placeholder="Emoji (e.g. 🎮)" style="width:95px;" />
+              <select id="rp-role" style="flex:1; min-width:140px;"></select>
+              <input type="text" id="rp-label" placeholder="Button label (e.g. Rust Squad)" style="flex:1; min-width:140px;" />
+              <select id="rp-style" style="width:110px;">
+                <option value="primary">Blue</option>
+                <option value="success">Green</option>
+                <option value="danger">Red</option>
+                <option value="secondary">Gray</option>
+              </select>
+              <button class="btn btn-outline btn-sm" type="button" onclick="addCustomRoleItem()">+ Add</button>
+            </div>
+            <div id="rp-items-list" class="pill-list" style="margin-top:10px;"></div>
+
+            <div style="margin-top:14px;" class="row">
+              <button class="btn" onclick="postRolePanel()">🎭 Deploy Role Panel</button>
+              <button class="btn btn-outline btn-sm" onclick="customRoleItems=[]; renderCustomRoleItems();">Clear List</button>
             </div>
           </div>
 
@@ -612,6 +672,139 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- TAB 5: MUSIC & VOICE PLAYER -->
+    <div id="tab-music" class="tab-content">
+      <div class="grid">
+        <div>
+          <div class="card">
+            <h2>🎵 Live Music Player</h2>
+            <p class="sub">Control playback, volume, and queue directly from your browser. Supports YouTube, YouTube Playlists, and Spotify Track links!</p>
+            <div id="music-now-playing" style="background:var(--panel-alt); padding:14px; border-radius:8px; border:1px solid var(--border); margin-bottom:14px;">
+              Nothing is currently playing.
+            </div>
+            <div class="row" style="flex-wrap:wrap; margin-bottom:14px;">
+              <button class="btn btn-sm" onclick="musicAct('pause')">⏯️ Pause / Resume</button>
+              <button class="btn btn-outline btn-sm" onclick="musicAct('skip')">⏭️ Skip</button>
+              <button class="btn btn-outline btn-sm" onclick="musicAct('loop')">🔁 Loop</button>
+              <button class="btn btn-outline btn-sm" onclick="musicAct('shuffle')">🔀 Shuffle</button>
+              <button class="btn btn-danger btn-sm" onclick="musicAct('stop')">⏹️ Stop</button>
+              <button class="btn btn-danger btn-sm" onclick="musicAct('leave')">👋 Leave VC</button>
+            </div>
+            <label>Volume: <span id="music-vol-label">20%</span></label>
+            <input type="range" id="music-vol-slider" min="1" max="200" value="20" oninput="document.getElementById('music-vol-label').textContent = this.value + '%'" onchange="musicAct('volume', { percent: Number(this.value) })" />
+
+            <label style="margin-top:16px;">Play / Queue Song, Playlist, or Spotify Link</label>
+            <select id="music-vc-select" style="margin-bottom:8px;"></select>
+            <div class="row">
+              <input type="text" id="music-query" placeholder="YouTube URL, Playlist, Spotify link, or search..." onkeydown="if(event.key==='Enter'){musicPlay();event.preventDefault();}" />
+              <button class="btn btn-success" onclick="musicPlay()">▶️ Play</button>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <h2>📜 Current Music Queue</h2>
+            <p class="sub">Upcoming tracks in the active server.</p>
+            <div id="music-queue-list"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 6: RUST TRACKER & WIPE MONITOR -->
+    <div id="tab-rust" class="tab-content">
+      <div class="grid">
+        <div>
+          <div class="card">
+            <h2>☢️ BattleMetrics Rust Server & Wipe Tracker</h2>
+            <p class="sub">Track live player counts, queues, and get automatic Wipe Alerts in Discord. Paste any BattleMetrics server ID or URL (e.g. <code>battlemetrics.com/servers/rust/9565287</code>).</p>
+            <label>Live Status & Wipe Alert Channel (Optional)</label>
+            <select id="rust-channel-select"></select>
+            <div style="margin-top:10px;">
+              <button class="btn btn-outline btn-sm" onclick="saveRustChannel()">💾 Save Alert Channel</button>
+            </div>
+
+            <label style="margin-top:16px;">Add Rust Server (BattleMetrics ID or URL)</label>
+            <div class="row">
+              <input type="text" id="rust-bm-input" placeholder="e.g. 9565287 or https://www.battlemetrics.com/servers/rust/..." />
+              <button class="btn btn-success" onclick="addRustServer()">➕ Track</button>
+            </div>
+            <div style="margin-top:14px;">
+              <button class="btn" onclick="refreshRustNow()">🔄 Refresh Live Stats & Update Discord</button>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <h2>📡 Tracked Rust Servers</h2>
+            <p class="sub">Live stats auto-update every 5 minutes.</p>
+            <div id="rust-servers-list"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 7: MODERATION, WELCOME & LIVE LOGS -->
+    <div id="tab-mod" class="tab-content">
+      <div class="grid">
+        <div>
+          <div class="card">
+            <h2>🛡️ Welcome Banner, Audit Logs & Auto-Mod</h2>
+            <p class="sub">Configure automated server protection and logging for your French & Austrian Mods.</p>
+
+            <label>Audit / Mod Log Channel (Joins, Leaves, Deletes, Edits, Bans)</label>
+            <select id="mod-log-channel"></select>
+
+            <label>Welcome Banner Channel</label>
+            <select id="mod-welcome-channel"></select>
+
+            <label>Welcome Message Template (supports <code>{mention}</code>, <code>{user}</code>, <code>{server}</code>, <code>{count}</code>)</label>
+            <textarea id="mod-welcome-msg" rows="3"></textarea>
+
+            <label class="checkbox-row">
+              <input type="checkbox" id="mod-anti-invite" />
+              <span>🚫 <b>Auto-Mod:</b> Block unauthorized Discord invite links (skips Mods/Admins)</span>
+            </label>
+
+            <label>Max Mentions per Message (0 = Disabled)</label>
+            <input type="number" id="mod-max-mentions" min="0" max="50" value="6" />
+
+            <label>Blocked Words (comma-separated, optional)</label>
+            <input type="text" id="mod-banned-words" placeholder="word1, word2, ..." />
+
+            <div style="margin-top:16px;">
+              <button class="btn btn-success" onclick="saveModSettings()">💾 Save Moderation Settings</button>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <h2>📜 Live Bot Console Logs</h2>
+            <p class="sub">Real-time view of the last 150 bot events and errors.</p>
+            <div style="margin-bottom:10px;">
+              <button class="btn btn-outline btn-sm" onclick="loadLiveLogs()">🔄 Refresh Logs</button>
+            </div>
+            <pre id="live-logs-box" style="background:#0a0c12; color:#cdd6f4; border:1px solid var(--border); border-radius:8px; padding:12px; height:440px; overflow-y:auto; font-size:0.78rem; white-space:pre-wrap;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGIN MODAL (Only shown when WEB_PASSWORD is set and missing/invalid) -->
+  <div id="auth-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.82); z-index:10000; align-items:center; justify-content:center;">
+    <div class="card" style="max-width:380px; width:90%; margin:0;">
+      <h2>🔐 Dashboard Login</h2>
+      <p class="sub">This Control Panel is protected by <code>WEB_PASSWORD</code>.</p>
+      <input type="password" id="auth-pass-input" placeholder="Enter WEB_PASSWORD..." onkeydown="if(event.key==='Enter'){submitAuth();}" />
+      <div style="margin-top:14px;">
+        <button class="btn" onclick="submitAuth()">🔓 Unlock Panel</button>
+      </div>
+    </div>
   </div>
 
   <div id="toast"></div>
@@ -619,6 +812,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <script>
     let STATE = null;
     let currentGames = ["Rust", "League of Legends", "Dark and Darker"];
+    let customRoleItems = [];
 
     function showToast(msg, isError = false) {
       const t = document.getElementById("toast");
@@ -633,16 +827,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.querySelectorAll(".tab-btn").forEach(el => el.classList.remove("active"));
       document.getElementById("tab-" + name).classList.add("active");
       btn.classList.add("active");
+      if (name === "mod") loadLiveLogs();
+    }
+
+    function submitAuth() {
+      const val = document.getElementById("auth-pass-input").value.trim();
+      if (val) {
+        localStorage.setItem("web_auth_key", val);
+        document.getElementById("auth-modal").style.display = "none";
+        loadState();
+      }
     }
 
     async function api(path, method = "GET", body = null) {
       const opts = { method, headers: { "Content-Type": "application/json" } };
       const params = new URLSearchParams(window.location.search);
-      if (params.get("key")) {
-        opts.headers["X-Auth-Key"] = params.get("key");
+      const authKey = params.get("key") || localStorage.getItem("web_auth_key") || "";
+      if (authKey) {
+        opts.headers["X-Auth-Key"] = authKey;
       }
       if (body) opts.body = JSON.stringify(body);
       const res = await fetch(path, opts);
+      if (res.status === 401) {
+        document.getElementById("auth-modal").style.display = "flex";
+        throw new Error("Password required");
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Request failed");
       return data;
@@ -752,16 +961,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       });
 
       // Populate text channels
-      const textChanSelects = ["feed-channel-select", "role-panel-channel"];
+      const textChanSelects = ["feed-channel-select", "role-panel-channel", "rust-channel-select", "mod-log-channel", "mod-welcome-channel"];
       textChanSelects.forEach(selId => {
         const cSel = document.getElementById(selId);
         if (!cSel) return;
-        cSel.innerHTML = "";
+        cSel.innerHTML = (selId === "rust-channel-select" || selId === "mod-log-channel" || selId === "mod-welcome-channel")
+          ? '<option value="">-- Disabled / None --</option>'
+          : "";
         g.channels.filter(c => c.type === "text").forEach(c => {
           const o = document.createElement("option");
           o.value = c.id;
           o.textContent = `#${c.name} (${c.category_name || "No Category"})`;
           cSel.appendChild(o);
+        });
+      });
+
+      // Populate all channels for Permissions Quick-Editor
+      const pChan = document.getElementById("perm-channel-select");
+      if (pChan) {
+        pChan.innerHTML = "";
+        g.channels.forEach(c => {
+          const ic = c.type === "voice" ? "🔊" : (c.type === "forum" ? "📋" : "#");
+          const o = document.createElement("option");
+          o.value = c.id;
+          o.textContent = `${ic} ${c.name} (${c.category_name || "No Category"})`;
+          pChan.appendChild(o);
+        });
+      }
+
+      // Populate role selects for Permissions Editor & Custom Role Panel Builder
+      const assignRoles = (g.roles || []).filter(r => !r.managed && r.name !== "@everyone");
+      ["perm-role-select", "rp-role"].forEach(selId => {
+        const el = document.getElementById(selId);
+        if (!el) return;
+        el.innerHTML = "";
+        assignRoles.forEach(r => {
+          const o = document.createElement("option");
+          o.value = r.id;
+          o.textContent = r.name;
+          el.appendChild(o);
         });
       });
 
@@ -781,20 +1019,44 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         });
       });
 
-      // Populate voice channels for lobby
-      const vSel = document.getElementById("lobby-voice-select");
-      vSel.innerHTML = "";
-      g.channels.filter(c => c.type === "voice").forEach(c => {
-        const o = document.createElement("option");
-        o.value = c.id;
-        o.textContent = `🔊 ${c.name} (${c.category_name || "No Category"})`;
-        vSel.appendChild(o);
+      // Populate voice channels for lobby & music player
+      ["lobby-voice-select", "music-vc-select"].forEach(selId => {
+        const vSel = document.getElementById(selId);
+        if (!vSel) return;
+        vSel.innerHTML = selId === "music-vc-select" ? '<option value="">-- Auto-detect Active Voice Channel --</option>' : "";
+        g.channels.filter(c => c.type === "voice").forEach(c => {
+          const o = document.createElement("option");
+          o.value = c.id;
+          o.textContent = `🔊 ${c.name} (${c.category_name || "No Category"})`;
+          vSel.appendChild(o);
+        });
       });
+
+      // Sync Mod & Rust settings fields
+      const ms = STATE.config.mod_settings || {};
+      const mLog = document.getElementById("mod-log-channel");
+      if (mLog) mLog.value = ms.mod_log_channel_id || "";
+      const mWel = document.getElementById("mod-welcome-channel");
+      if (mWel) mWel.value = ms.welcome_channel_id || "";
+      const mMsg = document.getElementById("mod-welcome-msg");
+      if (mMsg) mMsg.value = ms.welcome_message || "";
+      const mInv = document.getElementById("mod-anti-invite");
+      if (mInv) mInv.checked = Boolean(ms.anti_invite);
+      const mMax = document.getElementById("mod-max-mentions");
+      if (mMax) mMax.value = ms.max_mentions ?? 6;
+      const mBw = document.getElementById("mod-banned-words");
+      if (mBw) mBw.value = (ms.banned_words || []).join(", ");
+
+      const rt = STATE.config.rust_tracker || {};
+      const rCh = document.getElementById("rust-channel-select");
+      if (rCh) rCh.value = rt.channel_id || "";
 
       renderChannelsTree(g);
       renderLobbies(g);
       renderRolesList(g);
       renderMembersRoles(g);
+      renderMusic(g);
+      renderRustServers();
     }
 
     function renderFeeds() {
@@ -1156,17 +1418,210 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    function addCustomRoleItem() {
+      const emoji = document.getElementById("rp-emoji").value.trim() || "🎭";
+      const rSel = document.getElementById("rp-role");
+      const roleId = rSel.value;
+      const roleName = rSel.options[rSel.selectedIndex]?.text || "Role";
+      const label = document.getElementById("rp-label").value.trim() || roleName;
+      const style = document.getElementById("rp-style").value;
+      if (!roleId) return;
+      customRoleItems.push({ emoji, role_id: roleId, label, style });
+      document.getElementById("rp-emoji").value = "";
+      document.getElementById("rp-label").value = "";
+      renderCustomRoleItems();
+    }
+
+    function renderCustomRoleItems() {
+      const box = document.getElementById("rp-items-list");
+      if (!box) return;
+      box.innerHTML = "";
+      customRoleItems.forEach((it, idx) => {
+        const sp = document.createElement("span");
+        sp.className = "pill";
+        sp.innerHTML = `${it.emoji} ${it.label} <button onclick="customRoleItems.splice(${idx},1); renderCustomRoleItems();">&times;</button>`;
+        box.appendChild(sp);
+      });
+    }
+
     async function postRolePanel() {
       try {
         const g = getCurrentGuild();
         const cid = document.getElementById("role-panel-channel").value;
         if (!g || !cid) return;
-        await api("/api/roles/panel", "POST", { guild_id: g.id, channel_id: cid });
+        await api("/api/roles/panel", "POST", {
+          guild_id: g.id,
+          channel_id: cid,
+          title: document.getElementById("rp-title")?.value.trim() || "",
+          description: document.getElementById("rp-desc")?.value.trim() || "",
+          items: customRoleItems.length ? customRoleItems : null,
+        });
         showToast("🎭 Role Selection Panel posted!");
         await loadState();
       } catch (e) {
         document.getElementById("bot-status").textContent = "Error: " + e.message;
         showToast(e.message, true);
+      }
+    }
+
+    async function applyChannelPerm() {
+      try {
+        const g = getCurrentGuild();
+        if (!g) return;
+        await api("/api/channels/permissions", "POST", {
+          guild_id: g.id,
+          channel_id: document.getElementById("perm-channel-select").value,
+          action: document.getElementById("perm-action").value,
+          role_id: document.getElementById("perm-role-select").value || null,
+        });
+        showToast("🔐 Channel permissions updated!");
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    function renderMusic(g) {
+      const npBox = document.getElementById("music-now-playing");
+      const qBox = document.getElementById("music-queue-list");
+      if (!npBox || !qBox || !g) return;
+      const m = g.music || {};
+      const slider = document.getElementById("music-vol-slider");
+      const volLbl = document.getElementById("music-vol-label");
+      if (slider && volLbl && m.volume) {
+        slider.value = m.volume;
+        volLbl.textContent = m.volume + "%";
+      }
+      if (m.current) {
+        const st = m.paused ? "⏸️ Paused" : "▶️ Now Playing";
+        const lp = m.looping ? " • 🔁 Loop ON" : "";
+        npBox.innerHTML = `<strong>${st}:</strong> ${m.current.title} <div style="font-size:0.82rem;color:var(--muted);">Channel: ${m.voice_channel || "Connected"}${lp}</div>`;
+      } else {
+        npBox.innerHTML = '<span style="color:var(--muted);">Nothing is currently playing.</span>';
+      }
+      qBox.innerHTML = "";
+      const q = m.queue || [];
+      if (!q.length) {
+        qBox.innerHTML = '<p style="color:var(--muted);">Queue is empty.</p>';
+        return;
+      }
+      q.forEach((s, idx) => {
+        const div = document.createElement("div");
+        div.className = "chan-item";
+        div.innerHTML = `<span><b>${idx + 1}.</b> ${s.title}</span> <button class="btn btn-danger btn-sm" onclick="musicAct('remove', { index: ${idx} })">🗑️</button>`;
+        qBox.appendChild(div);
+      });
+    }
+
+    async function musicAct(action, extra = {}) {
+      try {
+        const g = getCurrentGuild();
+        if (!g) return;
+        await api("/api/music/action", "POST", Object.assign({ guild_id: g.id, action }, extra));
+        showToast("🎵 Updated music player!");
+        setTimeout(loadState, 600);
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    async function musicPlay() {
+      const q = document.getElementById("music-query").value.trim();
+      if (!q) return;
+      const vcId = document.getElementById("music-vc-select").value;
+      await musicAct("play", { query: q, voice_channel_id: vcId });
+      document.getElementById("music-query").value = "";
+    }
+
+    function renderRustServers() {
+      const box = document.getElementById("rust-servers-list");
+      if (!box || !STATE) return;
+      const rt = STATE.config.rust_tracker || {};
+      const cache = STATE.rust_cache || {};
+      const srvs = rt.servers || [];
+      box.innerHTML = "";
+      if (!srvs.length) {
+        box.innerHTML = '<p style="color:var(--muted);">No Rust servers tracked yet. Add a BattleMetrics ID on the left!</p>';
+        return;
+      }
+      srvs.forEach(s => {
+        const live = cache[s.id] || {};
+        const status = live.status === "online" ? "🟢 Online" : (live.status ? "🔴 Offline" : "⏳ Pending refresh");
+        const pop = live.max_players ? `${live.players}/${live.max_players} players` : "";
+        const div = document.createElement("div");
+        div.className = "feed-item";
+        div.innerHTML = `
+          <div class="feed-header">
+            <div>
+              <strong>${live.name || s.name || "Server " + s.id}</strong>
+              <div style="font-size:0.82rem;color:var(--muted);">${status} ${pop ? "• " + pop : ""} • ID: <code>${s.id}</code></div>
+            </div>
+            <button class="btn btn-danger btn-sm" onclick="removeRustServer('${s.id}')">🗑️</button>
+          </div>
+        `;
+        box.appendChild(div);
+      });
+    }
+
+    async function saveRustChannel() {
+      try {
+        await api("/api/rust/config", "POST", { action: "set_channel", channel_id: document.getElementById("rust-channel-select").value });
+        showToast("☢️ Rust alert channel saved!");
+        await loadState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function addRustServer() {
+      const raw = document.getElementById("rust-bm-input").value.trim();
+      if (!raw) return;
+      try {
+        await api("/api/rust/config", "POST", { action: "add_server", server: raw });
+        document.getElementById("rust-bm-input").value = "";
+        showToast("☢️ Added Rust server to tracker!");
+        await loadState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function removeRustServer(id) {
+      try {
+        await api("/api/rust/config", "POST", { action: "remove_server", server_id: id });
+        showToast("🗑️ Removed Rust server.");
+        await loadState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function refreshRustNow() {
+      try {
+        await api("/api/rust/refresh", "POST");
+        showToast("☢️ Refreshed live BattleMetrics stats!");
+        await loadState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function saveModSettings() {
+      try {
+        const bw = document.getElementById("mod-banned-words").value.split(",").map(x => x.trim()).filter(Boolean);
+        await api("/api/mod/settings", "POST", {
+          mod_log_channel_id: document.getElementById("mod-log-channel").value,
+          welcome_channel_id: document.getElementById("mod-welcome-channel").value,
+          welcome_message: document.getElementById("mod-welcome-msg").value,
+          anti_invite: document.getElementById("mod-anti-invite").checked,
+          max_mentions: Number(document.getElementById("mod-max-mentions").value || 0),
+          banned_words: bw,
+        });
+        showToast("🛡️ Moderation & Welcome settings saved!");
+        await loadState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function loadLiveLogs() {
+      const box = document.getElementById("live-logs-box");
+      if (!box) return;
+      try {
+        const res = await api("/api/logs");
+        box.textContent = (res.logs || []).map(l => l.message).join("\n") || "No logs yet.";
+        box.scrollTop = box.scrollHeight;
+      } catch (e) {
+        box.textContent = "Failed loading logs: " + e.message;
       }
     }
 
@@ -1212,12 +1667,14 @@ def create_web_app(
     trigger_drops_cb,
     setup_roles_cb=None,
     post_role_panel_cb=None,
+    music_control_cb=None,
+    refresh_rust_cb=None,
+    log_buffer=None,
 ) -> web.Application:
     app = web.Application()
 
     async def index(request: web.Request) -> web.Response:
-        if not check_auth(request):
-            return web.Response(text="Unauthorized. Append ?key=YOUR_WEB_PASSWORD to URL.", status=401)
+        # Always serve HTML so the sleek Login Modal can prompt if WEB_PASSWORD is set
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
     async def get_state(request: web.Request) -> web.Response:
@@ -1270,6 +1727,19 @@ def create_web_app(
                 if not m.bot
             ][:250]
 
+            vc = g.voice_client
+            cur_song = getattr(bot, "current_song", {}).get(g.id)
+            q_songs = getattr(bot, "song_queue", {}).get(g.id, [])
+            music_info = {
+                "connected": bool(vc and vc.is_connected()),
+                "voice_channel": vc.channel.name if (vc and vc.channel) else None,
+                "paused": bool(vc and vc.is_paused()),
+                "looping": bool(getattr(bot, "looping", {}).get(g.id, False)),
+                "volume": int(getattr(bot, "volumes", {}).get(g.id, 0.2) * 100),
+                "current": {"title": cur_song.get("title", "Unknown")} if cur_song else None,
+                "queue": [{"title": s.get("title", "Unknown")} for s in q_songs[:30]],
+            }
+
             guilds_data.append(
                 {
                     "id": str(g.id),
@@ -1278,6 +1748,7 @@ def create_web_app(
                     "channels": channels,
                     "roles": roles,
                     "members": members,
+                    "music": music_info,
                 }
             )
 
@@ -1286,6 +1757,7 @@ def create_web_app(
                 "bot_name": str(bot.user) if bot.user else "Bot",
                 "guilds": guilds_data,
                 "config": config_mgr.data,
+                "rust_cache": getattr(bot, "rust_cache", {}),
             }
         )
 
@@ -1571,10 +2043,113 @@ def create_web_app(
         if not isinstance(ch, discord.TextChannel):
             return web.json_response({"error": "Text channel not found"}, status=404)
         try:
-            msg_id = await post_role_panel_cb(ch)
+            msg_id = await post_role_panel_cb(
+                ch,
+                title=body.get("title"),
+                description=body.get("description"),
+                items=body.get("items"),
+            )
             return web.json_response({"ok": True, "message_id": str(msg_id)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
+
+    async def edit_channel_permissions(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        guild = bot.get_guild(int(body.get("guild_id") or 0))
+        if not guild:
+            return web.json_response({"error": "Guild not found"}, status=404)
+        ch = guild.get_channel(int(body.get("channel_id") or 0))
+        if not ch:
+            return web.json_response({"error": "Channel not found"}, status=404)
+        act = body.get("action")
+        try:
+            if act == "make_private":
+                await ch.set_permissions(guild.default_role, view_channel=False)
+            elif act == "make_public":
+                await ch.set_permissions(guild.default_role, view_channel=True)
+            elif act == "lock_chat":
+                await ch.set_permissions(guild.default_role, send_messages=False)
+            elif act == "unlock_chat":
+                await ch.set_permissions(guild.default_role, send_messages=None)
+            elif act in ("grant_role", "revoke_role"):
+                role = guild.get_role(int(body.get("role_id") or 0))
+                if not role:
+                    return web.json_response({"error": "Role not found"}, status=404)
+                if act == "grant_role":
+                    await ch.set_permissions(role, view_channel=True, send_messages=True, connect=True)
+                else:
+                    await ch.set_permissions(role, overwrite=None)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def music_action(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        if not music_control_cb:
+            return web.json_response({"error": "Music controller unavailable"}, status=500)
+        body = await request.json()
+        gid = int(body.get("guild_id") or 0)
+        act = str(body.get("action") or "")
+        res = await music_control_cb(gid, act, body)
+        if "error" in res:
+            return web.json_response(res, status=400)
+        return web.json_response(res)
+
+    async def rust_config(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        from rust_tracker import parse_bm_id
+        body = await request.json()
+        act = body.get("action")
+        rt = config_mgr.data.setdefault("rust_tracker", {"channel_id": "", "message_id": None, "servers": []})
+        if act == "set_channel":
+            rt["channel_id"] = str(body.get("channel_id") or "").strip()
+            rt["message_id"] = None
+            config_mgr.save()
+        elif act == "add_server":
+            bm_id = parse_bm_id(str(body.get("server") or ""))
+            if not bm_id:
+                return web.json_response({"error": "Invalid BattleMetrics Server ID or URL"}, status=400)
+            if not any(s.get("id") == bm_id for s in rt["servers"]):
+                rt["servers"].append({"id": bm_id, "name": f"Rust Server {bm_id}", "last_wipe_seen": ""})
+                config_mgr.save()
+            if refresh_rust_cb:
+                bot.loop.create_task(refresh_rust_cb())
+        elif act == "remove_server":
+            sid = str(body.get("server_id") or "")
+            rt["servers"] = [s for s in rt["servers"] if s.get("id") != sid]
+            config_mgr.save()
+        return web.json_response({"ok": True})
+
+    async def rust_refresh(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        if refresh_rust_cb:
+            await refresh_rust_cb()
+        return web.json_response({"ok": True})
+
+    async def update_mod_settings(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        ms = config_mgr.data.setdefault("mod_settings", {})
+        ms["mod_log_channel_id"] = str(body.get("mod_log_channel_id") or "").strip()
+        ms["welcome_channel_id"] = str(body.get("welcome_channel_id") or "").strip()
+        ms["welcome_message"] = str(body.get("welcome_message") or "").strip()
+        ms["anti_invite"] = bool(body.get("anti_invite", False))
+        ms["max_mentions"] = max(0, int(body.get("max_mentions") or 0))
+        ms["banned_words"] = [str(w).strip().lower() for w in (body.get("banned_words") or []) if str(w).strip()]
+        config_mgr.save()
+        return web.json_response({"ok": True})
+
+    async def get_live_logs(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        logs = log_buffer.get_logs(150) if log_buffer else []
+        return web.json_response({"logs": logs})
 
     app.router.add_get("/", index)
     app.router.add_get("/api/state", get_state)
@@ -1587,10 +2162,16 @@ def create_web_app(
     app.router.add_post("/api/channels/create", create_channel)
     app.router.add_post("/api/channels/move", move_channel)
     app.router.add_post("/api/channels/delete", delete_channel)
+    app.router.add_post("/api/channels/permissions", edit_channel_permissions)
     app.router.add_post("/api/lobbies", save_lobby)
     app.router.add_delete("/api/lobbies/{id}", delete_lobby)
     app.router.add_post("/api/roles/member", member_role_toggle)
     app.router.add_post("/api/roles/setup_community", run_setup_community)
     app.router.add_post("/api/roles/panel", deploy_role_panel)
+    app.router.add_post("/api/music/action", music_action)
+    app.router.add_post("/api/rust/config", rust_config)
+    app.router.add_post("/api/rust/refresh", rust_refresh)
+    app.router.add_post("/api/mod/settings", update_mod_settings)
+    app.router.add_get("/api/logs", get_live_logs)
 
     return app
