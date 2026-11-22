@@ -46,7 +46,7 @@ QUIZ_QTY         = 5
 QUIZ_TIMEOUT     = 20
 TEAM_TIMEOUT     = 30
 POLL_DURATION    = 30
-DEFAULT_VOLUME   = 0.2
+DEFAULT_VOLUME   = 0.5
 AUTO_LEAVE_DELAY = 60
 STREAM_URL_TTL   = 1800  # Re-extract YouTube stream URLs older than 30 minutes
 
@@ -129,6 +129,9 @@ intents.members         = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # 5. yt-dlp Options
+MUSIC_CACHE_DIR = os.path.join(TMP_DIR, "discord_music")
+os.makedirs(MUSIC_CACHE_DIR, exist_ok=True)
+
 YDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -137,7 +140,9 @@ YDL_OPTS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "cachedir": os.path.join(TMP_DIR, "yt-dlp-cache"),
-    "extractor_args": {"youtube": ["player_client=android,web"]},  # Bypasses YouTube 403 blocks
+    "retries": 3,
+    "fragment_retries": 3,
+    "nocheckcertificate": True,
 }
 
 # Add cookie file if provided in env
@@ -189,12 +194,25 @@ def cancel_auto_leave(gid: int) -> None:
         task.cancel()
 
 
+def _cleanup_song_file(song: Optional[dict]) -> None:
+    if not song:
+        return
+    fp = song.pop("local_path", None)
+    if fp and os.path.isfile(fp):
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
+
+
 def clear_state(gid: int) -> None:
     cancel_auto_leave(gid)
     if gid in bot.song_queue:
+        for s in bot.song_queue[gid]:
+            _cleanup_song_file(s)
         bot.song_queue[gid].clear()
         bot.song_queue.pop(gid, None)
-    bot.current_song.pop(gid, None)
+    _cleanup_song_file(bot.current_song.pop(gid, None))
     bot.looping.pop(gid, None)
     bot.volumes.pop(gid, None)
 
@@ -259,6 +277,7 @@ async def get_song_info(query: str, requester: Optional[str] = None) -> Optional
             "webpage_url": info.get("webpage_url") or clean_query,
             "query": clean_query,
             "duration": info.get("duration"),
+            "is_live": bool(info.get("is_live", False)),
             "thumbnail": info.get("thumbnail"),
             "user_agent": user_agent,
             "requester": requester,
@@ -267,6 +286,55 @@ async def get_song_info(query: str, requester: Optional[str] = None) -> Optional
     except Exception as e:
         logger.error("❌ YTDL Error for query %r: %s", query, e)
         return None
+
+
+async def download_song_audio(song: dict) -> Optional[str]:
+    """Downloads a non-live audio track via yt-dlp to /tmp so FFmpeg plays a local file without 403/hangs."""
+    existing = song.get("local_path")
+    if existing and os.path.isfile(existing) and os.path.getsize(existing) > 0:
+        return existing
+    if song.get("is_live"):
+        return None
+
+    target_url = song.get("webpage_url") or song.get("query") or ""
+    if not target_url:
+        return None
+
+    uid = uuid.uuid4().hex[:12]
+    out_tmpl = os.path.join(MUSIC_CACHE_DIR, f"{uid}.%(ext)s")
+    dl_opts = dict(YDL_OPTS)
+    dl_opts["outtmpl"] = out_tmpl
+    dl_opts["noplaylist"] = True
+
+    def _run_dl() -> Optional[str]:
+        with YoutubeDL(dl_opts) as ydl:
+            info = ydl.extract_info(target_url, download=True)
+            if not info:
+                return None
+            if "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    return None
+                info = entries[0]
+            # yt-dlp records final file path in requested_downloads or prepare_filename
+            req_dls = info.get("requested_downloads") or []
+            if req_dls and req_dls[0].get("filepath") and os.path.isfile(req_dls[0]["filepath"]):
+                return req_dls[0]["filepath"]
+            fname = ydl.prepare_filename(info)
+            if os.path.isfile(fname):
+                return fname
+        return None
+
+    try:
+        loop = asyncio.get_running_loop()
+        local_path = await loop.run_in_executor(None, _run_dl)
+        if local_path and os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+            song["local_path"] = local_path
+            logger.info("📥 Downloaded audio locally: %s (%.2f MB)", song.get("title"), os.path.getsize(local_path) / (1024 * 1024))
+            return local_path
+    except Exception as e:
+        logger.warning("Local audio download failed for %r, will try direct stream: %s", song.get("title"), e)
+    return None
 
 
 async def get_songs_info(query: str, requester: Optional[str] = None, max_playlist: int = 25) -> List[dict]:
@@ -398,8 +466,11 @@ async def play_next(guild: discord.Guild) -> None:
             logger.error("Playback error in guild %s: %s", guild.id, error)
 
         # Only re-queue on loop if the song wasn't explicitly stopped/cleared
-        if bot.looping.get(guild.id) and bot.current_song.get(guild.id) is song:
+        is_looping = bool(bot.looping.get(guild.id) and bot.current_song.get(guild.id) is song)
+        if is_looping:
             bot.song_queue.setdefault(guild.id, []).insert(0, song)
+        else:
+            _cleanup_song_file(song)
 
         if guild.voice_client:
             fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
@@ -410,25 +481,38 @@ async def play_next(guild: discord.Guild) -> None:
             )
 
     try:
-        user_agent = song.get("user_agent", "Mozilla/5.0")
-        before_options = (
-            f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-            f'-nostdin -user_agent "{user_agent}"'
-        )
-
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(
+        # Prefer local temp file downloaded by yt-dlp (eliminates YouTube 403/SABR FFmpeg hangs & silent green ring)
+        local_path = await download_song_audio(song)
+        if local_path:
+            audio_input = discord.FFmpegPCMAudio(
+                local_path,
+                executable=FFMPEG_EXE,
+                before_options="-nostdin",
+                options="-vn",
+            )
+        else:
+            user_agent = song.get("user_agent", "Mozilla/5.0")
+            before_options = (
+                f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
+                f'-nostdin -user_agent "{user_agent}"'
+            )
+            audio_input = discord.FFmpegPCMAudio(
                 song["stream_url"],
                 executable=FFMPEG_EXE,
                 before_options=before_options,
                 options="-vn",
-            ),
+            )
+
+        source = discord.PCMVolumeTransformer(
+            audio_input,
             volume=bot.volumes.get(guild.id, DEFAULT_VOLUME),
         )
         vc.play(source, after=_after_playback)
+        logger.info("▶️ Playing in %s: %s (local=%s)", guild.name, song.get("title"), bool(local_path))
 
     except Exception as e:
         logger.error("❌ Playback failed in guild %s: %s", guild.id, e)
+        _cleanup_song_file(song)
         await play_next(guild)
 
 
