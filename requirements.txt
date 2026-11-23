@@ -1,4 +1,5 @@
 discord.py[voice]
+davey>=0.1.0,<0.2.0
 yt-dlp
 python-dotenv
 aiohttp
