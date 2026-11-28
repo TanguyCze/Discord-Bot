@@ -53,6 +53,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "message_id": None,
         "servers": [],
     },
+    "music_settings": {
+        "dj_only": True,
+        "dj_role_ids": ["1576264521608208385"],
+        "max_queue_size": 25,
+    },
 }
 
 
@@ -709,6 +714,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <p class="sub">Upcoming tracks in the active server.</p>
             <div id="music-queue-list"></div>
           </div>
+
+          <div class="card">
+            <h2>🎧 DJ Role & Anti-Spam Music Access</h2>
+            <p class="sub">Stop random members from spamming the music bot. Admins (HRE) always have access.</p>
+            <label class="checkbox-row">
+              <input type="checkbox" id="music-dj-only" checked />
+              <span>🔒 <b>DJ-Only Mode:</b> Only members with an allowed DJ role can play, skip, stop, or control music</span>
+            </label>
+            <label>Allowed DJ Roles</label>
+            <div class="row">
+              <select id="music-dj-role-select"></select>
+              <button class="btn btn-outline btn-sm" type="button" onclick="addDjRole()">+ Add Role</button>
+            </div>
+            <div id="music-dj-roles-list" class="pill-list" style="margin-top:8px;"></div>
+            <label>Max Queue Size (Anti-Spam Limit)</label>
+            <input type="number" id="music-max-queue" min="1" max="100" value="25" />
+            <div style="margin-top:14px;">
+              <button class="btn btn-success" onclick="saveMusicSettings()">💾 Save DJ Permissions</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -989,9 +1014,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         });
       }
 
-      // Populate role selects for Permissions Editor & Custom Role Panel Builder
+      // Populate role selects for Permissions Editor, Custom Role Panel Builder & DJ Role
       const assignRoles = (g.roles || []).filter(r => !r.managed && r.name !== "@everyone");
-      ["perm-role-select", "rp-role"].forEach(selId => {
+      ["perm-role-select", "rp-role", "music-dj-role-select"].forEach(selId => {
         const el = document.getElementById(selId);
         if (!el) return;
         el.innerHTML = "";
@@ -1056,6 +1081,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       renderRolesList(g);
       renderMembersRoles(g);
       renderMusic(g);
+      renderDjRoles(g);
       renderRustServers();
     }
 
@@ -1519,6 +1545,58 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         await api("/api/music/action", "POST", Object.assign({ guild_id: g.id, action }, extra));
         showToast("🎵 Updated music player!");
         setTimeout(loadState, 600);
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    let djRoleIds = [];
+
+    function renderDjRoles(g) {
+      const mcfg = (STATE && STATE.config && STATE.config.music_settings) || { dj_only: true, dj_role_ids: ["1576264521608208385"], max_queue_size: 25 };
+      const chk = document.getElementById("music-dj-only");
+      if (chk) chk.checked = Boolean(mcfg.dj_only);
+      const mq = document.getElementById("music-max-queue");
+      if (mq) mq.value = mcfg.max_queue_size || 25;
+      djRoleIds = [...(mcfg.dj_role_ids || [])];
+      drawDjRolePills(g);
+    }
+
+    function drawDjRolePills(g) {
+      const box = document.getElementById("music-dj-roles-list");
+      if (!box) return;
+      box.innerHTML = "";
+      if (!djRoleIds.length) {
+        box.innerHTML = '<span style="font-size:0.8rem;color:var(--muted);">No DJ roles selected (only Admins can play)</span>';
+        return;
+      }
+      djRoleIds.forEach((rid, idx) => {
+        const rObj = (g && g.roles ? g.roles : []).find(x => x.id === rid);
+        const label = rObj ? rObj.name : `Role ${rid}`;
+        const sp = document.createElement("span");
+        sp.className = "pill";
+        sp.innerHTML = `🎧 ${label} <button onclick="djRoleIds.splice(${idx},1); drawDjRolePills(getCurrentGuild());">&times;</button>`;
+        box.appendChild(sp);
+      });
+    }
+
+    function addDjRole() {
+      const sel = document.getElementById("music-dj-role-select");
+      if (sel && sel.value && !djRoleIds.includes(sel.value)) {
+        djRoleIds.push(sel.value);
+        drawDjRolePills(getCurrentGuild());
+      }
+    }
+
+    async function saveMusicSettings() {
+      try {
+        await api("/api/music/settings", "POST", {
+          dj_only: document.getElementById("music-dj-only").checked,
+          dj_role_ids: djRoleIds,
+          max_queue_size: Number(document.getElementById("music-max-queue").value || 25),
+        });
+        showToast("🎧 DJ music permissions saved!");
+        await loadState();
       } catch (e) {
         showToast(e.message, true);
       }
@@ -2145,6 +2223,17 @@ def create_web_app(
         config_mgr.save()
         return web.json_response({"ok": True})
 
+    async def update_music_settings(request: web.Request) -> web.Response:
+        if not check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        body = await request.json()
+        ms = config_mgr.data.setdefault("music_settings", {})
+        ms["dj_only"] = bool(body.get("dj_only", True))
+        ms["dj_role_ids"] = [str(x).strip() for x in (body.get("dj_role_ids") or []) if str(x).strip()]
+        ms["max_queue_size"] = max(1, min(100, int(body.get("max_queue_size") or 25)))
+        config_mgr.save()
+        return web.json_response({"ok": True})
+
     async def get_live_logs(request: web.Request) -> web.Response:
         if not check_auth(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
@@ -2169,6 +2258,7 @@ def create_web_app(
     app.router.add_post("/api/roles/setup_community", run_setup_community)
     app.router.add_post("/api/roles/panel", deploy_role_panel)
     app.router.add_post("/api/music/action", music_action)
+    app.router.add_post("/api/music/settings", update_music_settings)
     app.router.add_post("/api/rust/config", rust_config)
     app.router.add_post("/api/rust/refresh", rust_refresh)
     app.router.add_post("/api/mod/settings", update_mod_settings)

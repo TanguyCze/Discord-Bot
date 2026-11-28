@@ -564,9 +564,43 @@ async def _send_reply(
         await ctx_or_inter.send(content=content, **kwargs)
 
 
+DEFAULT_DJ_ROLE_ID = "1576264521608208385"  # 🎧 DJ
+
+
+def has_dj_permission(member: Optional[discord.abc.User]) -> bool:
+    """Returns True if the user is allowed to control the music bot (Admins or configured DJ role)."""
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    mcfg = config_mgr.data.get("music_settings", {})
+    if not mcfg.get("dj_only", True):
+        return True
+    allowed_ids = {str(x) for x in (mcfg.get("dj_role_ids") or [DEFAULT_DJ_ROLE_ID])}
+    for r in member.roles:
+        if str(r.id) in allowed_ids or "dj" in r.name.lower():
+            return True
+    return False
+
+
+async def _deny_no_dj(ctx_or_inter: Union[commands.Context, discord.Interaction]) -> None:
+    msg = "🔒 Only members with the **🎧 DJ** role (or Admins) can control the music bot!"
+    if isinstance(ctx_or_inter, discord.Interaction):
+        if ctx_or_inter.response.is_done():
+            await ctx_or_inter.followup.send(msg, ephemeral=True)
+        else:
+            await ctx_or_inter.response.send_message(msg, ephemeral=True)
+    else:
+        await ctx_or_inter.send(msg, delete_after=8)
+
+
 async def _play_logic(ctx_or_inter: Union[commands.Context, discord.Interaction], query: str) -> None:
     if not ctx_or_inter.guild:
         return await _send_reply(ctx_or_inter, "❌ Music commands can only be used in a server.")
+
+    user = getattr(ctx_or_inter, "author", getattr(ctx_or_inter, "user", None))
+    if not has_dj_permission(user):
+        return await _deny_no_dj(ctx_or_inter)
 
     async with get_music_lock(ctx_or_inter.guild.id):
         vc = await ensure_voice(ctx_or_inter)
@@ -578,13 +612,18 @@ async def _play_logic(ctx_or_inter: Union[commands.Context, discord.Interaction]
         bot.looping.setdefault(gid, False)
         bot.volumes.setdefault(gid, DEFAULT_VOLUME)
 
-        user = getattr(ctx_or_inter, "author", getattr(ctx_or_inter, "user", None))
+        max_q = max(1, int(config_mgr.data.get("music_settings", {}).get("max_queue_size", 25)))
+        if len(bot.song_queue[gid]) >= max_q:
+            return await _send_reply(ctx_or_inter, f"❌ Queue is full (limit: **{max_q}** tracks).")
+
         requester = user.display_name if user else None
 
         songs = await get_songs_info(query, requester=requester)
         if not songs:
             return await _send_reply(ctx_or_inter, "❌ Could not find track or playlist.")
 
+        remaining_slots = max(1, max_q - len(bot.song_queue[gid]))
+        songs = songs[:remaining_slots]
         bot.song_queue[gid].extend(songs)
         cancel_auto_leave(gid)
 
@@ -710,12 +749,16 @@ async def music_control_action(guild_id: int, action: str, payload: dict) -> dic
 
 @bot.tree.command(name="play", description="Queue a song from YouTube (URL or search query)")
 async def slash_play(inter: discord.Interaction, query: str):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     await inter.response.defer(thinking=True)
     await _play_logic(inter, query)
 
 
 @bot.tree.command(name="skip", description="Skip current song")
 async def slash_skip(inter: discord.Interaction):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     vc = inter.guild.voice_client if inter.guild else None
     if vc and (vc.is_playing() or vc.is_paused()):
         # Prevent single-track loop from replaying the skipped track
@@ -764,6 +807,8 @@ async def slash_queue(inter: discord.Interaction):
 
 @bot.tree.command(name="leave", description="Disconnect bot from voice")
 async def slash_leave(inter: discord.Interaction):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     if inter.guild and inter.guild.voice_client:
         await cleanup_voice_client(inter.guild)
         await inter.response.send_message("👋 Bye!")
@@ -773,6 +818,8 @@ async def slash_leave(inter: discord.Interaction):
 
 @bot.tree.command(name="pause", description="Pause the current song")
 async def slash_pause(inter: discord.Interaction):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     vc = inter.guild.voice_client if inter.guild else None
     if vc and vc.is_playing():
         vc.pause()
@@ -783,6 +830,8 @@ async def slash_pause(inter: discord.Interaction):
 
 @bot.tree.command(name="resume", description="Resume playback")
 async def slash_resume(inter: discord.Interaction):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     vc = inter.guild.voice_client if inter.guild else None
     if vc and vc.is_paused():
         vc.resume()
@@ -793,6 +842,8 @@ async def slash_resume(inter: discord.Interaction):
 
 @bot.tree.command(name="stop", description="Stop music and clear queue")
 async def slash_stop(inter: discord.Interaction):
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     vc = inter.guild.voice_client if inter.guild else None
     if vc and inter.guild:
         gid = inter.guild.id
@@ -811,6 +862,8 @@ async def slash_stop(inter: discord.Interaction):
 async def slash_loop(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("❌ Server only.")
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     gid = inter.guild.id
     new_state = not bot.looping.get(gid, False)
     bot.looping[gid] = new_state
@@ -819,10 +872,12 @@ async def slash_loop(inter: discord.Interaction):
 
 
 @bot.tree.command(name="volume", description="Set playback volume (1-200%)")
-@app_commands.describe(percent="Volume percentage between 1 and 200 (default 20)")
+@app_commands.describe(percent="Volume percentage between 1 and 200 (default 50)")
 async def slash_volume(inter: discord.Interaction, percent: app_commands.Range[int, 1, 200]):
     if not inter.guild:
         return await inter.response.send_message("❌ Server only.")
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     gid = inter.guild.id
     vol = percent / 100.0
     bot.volumes[gid] = vol
@@ -838,6 +893,8 @@ async def slash_volume(inter: discord.Interaction, percent: app_commands.Range[i
 async def slash_shuffle(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("❌ Server only.")
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     queue = bot.song_queue.get(inter.guild.id, [])
     if len(queue) < 2:
         return await inter.response.send_message("❌ Not enough songs to shuffle.")
@@ -850,6 +907,8 @@ async def slash_shuffle(inter: discord.Interaction):
 async def slash_remove(inter: discord.Interaction, number: int):
     if not inter.guild:
         return await inter.response.send_message("❌ Server only.")
+    if not has_dj_permission(inter.user):
+        return await _deny_no_dj(inter)
     queue = bot.song_queue.get(inter.guild.id, [])
     if not queue:
         return await inter.response.send_message("❌ Queue is empty.")
@@ -900,6 +959,8 @@ async def play(ctx: commands.Context, *, query: str):
 
 @bot.command()
 async def skip(ctx: commands.Context):
+    if not has_dj_permission(ctx.author):
+        return await _deny_no_dj(ctx)
     vc = ctx.guild.voice_client if ctx.guild else None
     if vc and (vc.is_playing() or vc.is_paused()):
         if bot.looping.get(ctx.guild.id):
@@ -912,6 +973,8 @@ async def skip(ctx: commands.Context):
 
 @bot.command()
 async def stop(ctx: commands.Context):
+    if not has_dj_permission(ctx.author):
+        return await _deny_no_dj(ctx)
     vc = ctx.guild.voice_client if ctx.guild else None
     if vc and ctx.guild:
         gid = ctx.guild.id
@@ -926,6 +989,8 @@ async def stop(ctx: commands.Context):
 
 @bot.command()
 async def leave(ctx: commands.Context):
+    if not has_dj_permission(ctx.author):
+        return await _deny_no_dj(ctx)
     if ctx.guild and ctx.guild.voice_client:
         await cleanup_voice_client(ctx.guild)
         await ctx.send("👋 Bye!")
@@ -2129,6 +2194,8 @@ async def on_interaction(inter: discord.Interaction):
 
     # 2. Interactive Music Player Controls
     if custom_id.startswith("music_ctrl:"):
+        if not has_dj_permission(inter.user):
+            return await _deny_no_dj(inter)
         act = custom_id.split(":", 1)[1]
         gid = inter.guild.id
         vc = inter.guild.voice_client
